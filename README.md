@@ -1,5 +1,7 @@
 # mmkv-rs
 
+English | [简体中文](README.zh.md)
+
 A Rust port of [Tencent MMKV](https://github.com/Tencent/MMKV) **v2.4.3** with a
 **byte-compatible on-disk format**. Stores written by C++ MMKV v2.4.3 are read
 by this crate (including AES-CFB128 and key-expiration stores), and Rust-written
