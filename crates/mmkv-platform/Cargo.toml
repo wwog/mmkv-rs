@@ -2,6 +2,13 @@
 name = "mmkv-platform"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Platform abstraction traits for the MMKV Rust port: mmap, file locks, app lifecycle and storage roots."
 
 [dependencies]

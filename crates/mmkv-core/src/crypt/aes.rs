@@ -4,7 +4,7 @@
 //! state is `(ivec[16], num)`; `num` is always `stream_offset % 16`. Both
 //! encryption and decryption feed back the ciphertext byte.
 
-use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
 
 pub const AES_KEY_LEN: usize = 16;
@@ -26,12 +26,12 @@ enum Cipher {
 
 impl Cipher {
     fn encrypt_block(&self, block: &mut [u8; AES_IV_LEN]) {
-        let mut generic = GenericArray::clone_from_slice(block);
+        let mut generic = Array::from(*block);
         match self {
             Cipher::Aes128(cipher) => cipher.encrypt_block(&mut generic),
             Cipher::Aes256(cipher) => cipher.encrypt_block(&mut generic),
         }
-        block.copy_from_slice(&generic);
+        block.copy_from_slice(generic.as_slice());
     }
 }
 
@@ -72,11 +72,12 @@ impl AesCrypt {
         material[..key_len].copy_from_slice(&key[..key_len]);
 
         let cipher = if aes256 {
-            Cipher::Aes256(Aes256::new(GenericArray::from_slice(&material)))
+            Cipher::Aes256(Aes256::new(&Array::from(material)))
         } else {
-            Cipher::Aes128(Aes128::new(GenericArray::from_slice(
-                &material[..AES_KEY_LEN],
-            )))
+            let key: [u8; AES_KEY_LEN] = material[..AES_KEY_LEN]
+                .try_into()
+                .expect("AES-128 key length");
+            Cipher::Aes128(Aes128::new(&Array::from(key)))
         };
 
         let mut crypt = Self {

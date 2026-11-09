@@ -2,7 +2,14 @@
 name = "mmkv-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Platform-agnostic MMKV engine: on-disk format, MiniPB codec, CRC-32, AES-CFB128 encryption, expiration and multi-process sync."
 
 [dependencies]
 mmkv-platform.workspace = true

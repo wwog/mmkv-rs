@@ -2,7 +2,14 @@
 name = "mmkv-rs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "A byte-compatible Rust port of Tencent MMKV: fast memory-mapped key-value storage with AES-CFB128 encryption and key expiration."
 
 [dependencies]
 mmkv-core.workspace = true

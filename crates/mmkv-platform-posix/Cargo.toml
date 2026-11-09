@@ -2,7 +2,14 @@
 name = "mmkv-platform-posix"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Shared POSIX mmap, flock and ftruncate primitives for the MMKV Rust port."
 
 [dependencies]
 mmkv-platform.workspace = true

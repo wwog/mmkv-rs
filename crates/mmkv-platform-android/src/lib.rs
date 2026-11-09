@@ -75,13 +75,12 @@ impl AndroidPlatform {
     /// JNI. The caller owns the `JavaVM`/`Context`; both are only borrowed here.
     #[cfg(target_os = "android")]
     pub fn from_java(vm: &jni::JavaVM, context: &jni::objects::JObject<'_>) -> io::Result<Self> {
-        let mut env = vm
-            .get_env()
-            .map_err(|error| io::Error::other(format!("JavaVM::get_env: {error}")))?;
-
-        let files_dir = java_file_path(&mut env, context, "getFilesDir")?;
-        let cache_dir = java_file_path(&mut env, context, "getCacheDir")?;
-        Ok(Self::new(files_dir.join("mmkv"), cache_dir))
+        vm.attach_current_thread(|env| -> jni::errors::Result<Self> {
+            let files_dir = java_file_path(env, context, "getFilesDir")?;
+            let cache_dir = java_file_path(env, context, "getCacheDir")?;
+            Ok(Self::new(files_dir.join("mmkv"), cache_dir))
+        })
+        .map_err(|error| io::Error::other(format!("JNI: {error}")))
     }
 
     /// Fallback constructor for Rust Android apps that do not pass a JNI
@@ -111,26 +110,29 @@ impl AndroidPlatform {
 
 #[cfg(target_os = "android")]
 fn java_file_path(
-    env: &mut jni::JNIEnv<'_>,
+    env: &mut jni::Env<'_>,
     context: &jni::objects::JObject<'_>,
     method: &str,
-) -> io::Result<PathBuf> {
+) -> jni::errors::Result<PathBuf> {
+    let method_name = jni::strings::JNIString::from(method);
     let file = env
-        .call_method(context, method, "()Ljava/io/File;", &[])
-        .map_err(|error| io::Error::other(format!("{method}: {error}")))?
-        .l()
-        .map_err(|error| io::Error::other(format!("{method}: {error}")))?;
+        .call_method(
+            context,
+            &method_name,
+            jni::jni_sig!("()Ljava/io/File;"),
+            &[],
+        )?
+        .l()?;
     let path = env
-        .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])
-        .map_err(|error| io::Error::other(format!("{method}: {error}")))?
-        .l()
-        .map_err(|error| io::Error::other(format!("{method}: {error}")))?;
-    let string: jni::objects::JString = path.into();
-    let value: String = env
-        .get_string(&string)
-        .map_err(|error| io::Error::other(format!("{method}: {error}")))?
-        .into();
-    Ok(PathBuf::from(value))
+        .call_method(
+            &file,
+            jni::jni_str!("getAbsolutePath"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )?
+        .l()?;
+    let string = jni::objects::JString::cast_local(env, path)?;
+    Ok(PathBuf::from(string.try_to_string(env)?))
 }
 
 impl Platform for AndroidPlatform {

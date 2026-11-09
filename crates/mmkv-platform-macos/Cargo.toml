@@ -2,7 +2,14 @@
 name = "mmkv-platform-macos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "macOS, tvOS, watchOS and visionOS support for the MMKV Rust port, using objc2 Foundation."
 
 [dependencies]
 mmkv-platform.workspace = true
