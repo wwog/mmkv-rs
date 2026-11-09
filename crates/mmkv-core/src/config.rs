@@ -12,6 +12,11 @@ pub struct Mode(u32);
 impl Mode {
     pub const SINGLE_PROCESS: Mode = Mode(1 << 0);
     pub const MULTI_PROCESS: Mode = Mode(1 << 1);
+    /// Android `Context.MODE_MULTI_PROCESS` compatibility bit.
+    pub const CONTEXT_MODE_MULTI_PROCESS: Mode = Mode(1 << 2);
+    pub const ASHMEM: Mode = Mode(1 << 3);
+    /// Android `MMKV_BACKUP` (accepted for parity; currently a no-op).
+    pub const BACKUP: Mode = Mode(1 << 4);
     pub const READ_ONLY: Mode = Mode(1 << 5);
 
     pub const fn empty() -> Self {
@@ -24,6 +29,12 @@ impl Mode {
 
     pub const fn is_multi_process(self) -> bool {
         self.contains(Mode::MULTI_PROCESS)
+            || self.contains(Mode::CONTEXT_MODE_MULTI_PROCESS)
+            || self.contains(Mode::ASHMEM)
+    }
+
+    pub const fn is_ashmem(self) -> bool {
+        self.contains(Mode::ASHMEM)
     }
 
     pub const fn is_read_only(self) -> bool {

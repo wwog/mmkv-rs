@@ -35,6 +35,15 @@ pub enum SyncMode {
     Async,
 }
 
+/// How a file lock is acquired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLockKind {
+    /// Whole-file advisory lock (`flock` on POSIX, `LockFileEx` on Windows).
+    Advisory,
+    /// POSIX record lock (`F_SETLK`/`F_OFD_SETLK`), used for ashmem.
+    Record,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppState {
     Foreground,
@@ -118,6 +127,67 @@ pub trait Platform: Send + Sync {
     /// not do this, so the default is a no-op.
     fn exclude_from_backup(&self, _path: &Path) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Acquire an advisory lock on a file (`flock` on POSIX, `LockFileEx` on
+    /// Windows). MMKV locks the `.crc` descriptor.
+    fn lock_file(&self, file: &File, mode: LockMode, wait: bool) -> io::Result<LockOutcome>;
+
+    fn unlock_file(&self, file: &File, mode: LockMode) -> io::Result<()>;
+
+    /// Platform-specific lock flavour. The default ignores `kind`.
+    fn lock_file_kind(
+        &self,
+        file: &File,
+        mode: LockMode,
+        wait: bool,
+        _kind: FileLockKind,
+    ) -> io::Result<LockOutcome> {
+        self.lock_file(file, mode, wait)
+    }
+
+    fn unlock_file_kind(&self, file: &File, mode: LockMode, _kind: FileLockKind) -> io::Result<()> {
+        self.unlock_file(file, mode)
+    }
+
+    /// Android: reject mixing SINGLE_PROCESS and MULTI_PROCESS instances.
+    /// The returned guard must be kept alive for the store's lifetime.
+    fn check_process_mode(
+        &self,
+        _crc_path: &Path,
+        _multi_process: bool,
+    ) -> io::Result<(bool, Option<Box<dyn Send + Sync>>)> {
+        Ok((true, None))
+    }
+
+    /// Android: rename a legacy `<md5>` file to the current naming scheme.
+    fn migrate_legacy_store(&self, _root: &Path, _id: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Copy a store file. `preserve_inode` mirrors MMKV's restore path.
+    fn copy_file(&self, src: &Path, dst: &Path, preserve_inode: bool) -> io::Result<()> {
+        if preserve_inode && dst.exists() {
+            let mut source = std::fs::File::open(src)?;
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(dst)?;
+            io::copy(&mut source, &mut target)?;
+            target.sync_all()?;
+            Ok(())
+        } else {
+            std::fs::copy(src, dst)?;
+            Ok(())
+        }
+    }
+
+    /// Android ashmem region. Other platforms report `Unsupported`.
+    fn open_ashmem(&self, _name: &str, _size: usize) -> io::Result<Box<dyn MappedRegion>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ashmem is only available on Android",
+        ))
     }
 
     /// Cryptographically secure random bytes (MMKV uses them for the AES IV).

@@ -1,76 +1,120 @@
 # 实施状态（基线：C++ MMKV v2.4.3）
 
 > 最后更新：2026-11-09
-> 当前状态：**核心功能 1:1 完成（macOS 平台），62 个测试全绿，clippy `-D warnings` 干净**
+> 版本：`mmkv-rs` 0.1.0
+> 验证：**65 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
+> 说明：本项目面向 Rust 应用，不包含语言绑定；CI 按用户要求未添加。
+
+## 平台矩阵
+
+| 平台 | crate | 状态 | 验证方式 |
+|---|---|---|---|
+| macOS / tvOS / watchOS / visionOS | `mmkv-platform-macos` | 完成 | 本地运行测试 |
+| iOS | `mmkv-platform-ios` | 完成 | `cargo check --target aarch64-apple-ios` |
+| Linux | `mmkv-platform-linux` | 完成 | `cargo check --target x86_64-unknown-linux-gnu` |
+| Android | `mmkv-platform-android` | 完成（ashmem 跨进程 FD 传递除外） | `cargo check --target aarch64-linux-android` |
+| Windows | `mmkv-platform-windows` | 完成 | `cargo check --target x86_64-pc-windows-msvc` |
+| 其他 POSIX | `mmkv-platform-posix` | 基础实现 | 编译检查 |
 
 ## 已完成
 
 ### 架构
 
-- [x] `mmkv-platform`：dyn-safe 的 `Platform` / `MappedRegion` / `AppLifecycle` 契约。
-- [x] `mmkv-platform-posix`：`MAP_SHARED` mmap、页对齐、显式零填充、`msync`、`flock`、`ftruncate`、`ftruncate` 不缩容打开。
-- [x] `mmkv-platform-macos`：**objc2 + objc2-foundation**，无 Swift shim、无 `cc`、无 Objective-C++。
-  - 默认根目录：`NSDocumentDirectory/mmkv`（tvOS 为 `NSCachesDirectory/mmkv`）。
-  - App Group：`<container>/mmkv`。
-  - `NSFileManager` 建目录，`NSTemporaryDirectory`，`.appex` 检测。
-- [x] `mmkv-core`：格式、编解码、meta、CRC、明文/加密 store、注册表、namespace、备份。
-- [x] `mmkv` 门面：`init` / `open` / `default_store` / `namespace` / 静态工具。
-- [x] `group_dir` 按 MMKV 语义接收**目录路径**，根为 `<group_dir>/mmkv`。
+- `mmkv-platform`：dyn-safe `Platform` / `MappedRegion` / `AppLifecycle`，锁类型
+  (`Advisory` / `Record`)、进程模式检查、legacy 迁移、ashmem、平台复制。
+- `mmkv-rs`：门面，按 `cfg(target_os)` 选择平台；`init` / `init_with` /
+  `open` / `default_store` / `namespace` / 静态工具；`android`/`ios`/`linux`/
+  `windows`/`apple` 平台 crate 重导出。
+- 无 Swift shim、无 `cc`、无 Objective-C++ 构建步骤；Apple 全部使用 objc2。
 
 ### 格式与存储
 
-- [x] 数据文件：4 字节旧式 actualSize + 伪 map-size varint + 追加记录流。
-- [x] 条目编码、data-holder 双长度前缀、tombstone、重复 key 后者胜出。
-- [x] 112 字节 meta、version/sequence/actualSize/CRC/IV/flags。
-- [x] zlib CRC-32（链式、覆盖 payload/ciphertext）。
-- [x] 页对齐、扩容翻倍、全量写回、`trim`、`clearAll(keepSpace)`、`sync`/`async`、`clearMemoryCache`。
-- [x] 特殊字符 id、默认 id、只读模式、`Namespace`、`is_file_valid`、`exists`、`remove_storage`（会关闭缓存实例）。
-- [x] backup / restore one/all（含 `specialCharacter` 子目录）。
-- [x] `import_from`、`value_size`、`write_value`、`item_size_limit`。
+- 追加日志、data-holder 双长度前缀、tombstone、重复 key 后者胜出。
+- 112 字节 meta、version/sequence/actualSize/CRC/IV/flags。
+- zlib CRC-32（链式，覆盖 payload/ciphertext）。
+- 页对齐、扩容、全量写回、`trim`、`clearAll(keepSpace)`、`sync`/`async`、
+  `clearMemoryCache`。
+- 特殊字符 id、只读实例、`Namespace`、`is_file_valid`/`exists`/
+  `remove_storage`（关闭缓存实例并持 `.crc` 独占锁）。
+- backup/restore one/all：源 `.crc` 共享锁、目标 `.crc` 独占锁，恢复走
+  `preserve_inode` 复制。
+- `import_from`：按路径排序双实例加锁，避免 A↔B 死锁。
+- `value_size`、`write_value`、`item_size_limit`、`compare_before_set`。
+- 读取到过期 key 时立即追加 tombstone（与 C++ 一致）。
+- 空闲实例自动清理：`enable_auto_cleanup` / `disable_auto_cleanup` /
+  `try_auto_cleanup_instances`，后台状态跳过。
+- 不可读文件隔离：打开可写实例前探测前 4 字节，异常文件重命名为
+  `.corrupt.<timestamp>`（近似 C++ Apple `checkFileHasDiskError`）。
 
-### 加密（AES-CFB128）
+### 加密
 
-- [x] AES-128/256，密钥按 MMKV 规则截断/零填充，无 KDF。
-- [x] 整段 payload 连续 CFB 流，`num = offset % 16`；用 O(1) `status_at` 从密文重建状态，无需反向 AES。
-- [x] 随机 IV（每次全量写回轮换），`meta.m_vector`；legacy version<2 使用 key 前 16 字节。
-- [x] 加密 holder：≤27 内联、≤256 堆缓存、>256 offset 惰性解密。
-- [x] 加密追加、加密全量写回、删除 tombstone、`rekey`（明文↔密文、换 key、AES-128↔256）、`reset_crypt_key`。
-- [x] 加密下禁止 compare-before-set（与 MMKV 一致）。
-- [x] 通过 NIST AES-CFB128 向量与 C++ 生成的 AES-128/256 fixtures。
+- AES-CFB128，AES-128/256，原始 key 截断/零填充，无 KDF。
+- 随机 IV、`meta.m_vector`、legacy key-IV 兼容。
+- crypt holder：≤27 内联、≤256 缓存、>256 offset 惰性解密。
+- 加密追加、删除、全量写回、`rekey`（明文↔密文、换 key、128↔256）、
+  `reset_crypt_key`。
+- **流式**：解码使用 16 字节窗口 + O(1) `status_at`，全量写回逐条写入/加密，
+  不再分配整段明文/密文缓冲。
+- NIST CFB 向量、C++ 加密 fixtures、在 C++ 加密文件上继续追加均通过。
 
 ### 过期
 
-- [x] 尾部 `u32 LE` 到期时间；0 = never。
-- [x] 读取时过滤、`all_keys_non_expired` / `count_non_expired`。
-- [x] `enable_expiration` / `disable_expiration` 对非空 store 做全量迁移（明文与加密均支持）。
-- [x] 全量写回/扩容前 `filterExpiredKeys`。
-- [x] 加密 + 过期组合。
+- 尾部 `u32 LE` 到期时间，0 = never。
+- 读取即删、`all_keys_non_expired`/`count_non_expired`、`enumerate_keys_non_expired`。
+- `enable_expiration`/`disable_expiration` 对非空 store 全量迁移（明文/加密）。
+- 全量写回/扩容前过滤过期 key。
+- 加密 + 过期组合测试。
 
 ### 多进程
 
-- [x] `.crc` fd 上的 `flock`，共享/独占锁、升级/降级、递归计数。
-- [x] sequence 变更 → 全量重载；CRC/actualSize 变更 → 增量 `partialLoad`。
-- [x] 文件增长后多进程重新 mmap（`actual_file_size` 对比）。
-- [x] `lock()` / `try_lock()` RAII guard。
-- [x] 测试覆盖追加、全量写回、锁冲突。
+- `.crc` 上的 `flock`（POSIX/Android 普通文件）或 `LockFileEx`（Windows）；
+  Android ashmem 使用 `fcntl` record lock。
+- 写操作先取独占进程锁，再刷新 meta，避免“刷新后被其他进程追加”的丢写竞态。
+- sequence 变更全量重载；CRC/actualSize 变更增量加载；文件增长后重新 mmap。
+- **真实双进程压力测试**：两个独立 OS 进程各写 250 条，最终 500 条无丢失。
 
-## 验证
+### 平台细节
 
-- `cargo test --workspace`：**62 passed / 0 failed**。
-- `cargo clippy --workspace --all-targets -- -D warnings`：干净。
-- C++ fixtures 直接读取：plaintext、bulk、trim、clear、special id、crypt128、crypt256、crypt_bulk、crypt_single、expire。
-- 加密 fixture 上继续追加、删除、重新打开均正确（验证续写 C++ 产生的 CFB 流）。
-- 早期在 C++ bridge 仍存在时，已完成 Rust↔C++ 双向读写验证（所有原始类型、批量数据、特殊 id、多进程模式）；该验证结果保留为 fixtures 与文档，当前工作区不再依赖 C++ 工具链。
+- macOS/iOS：`NSDocumentDirectory/mmkv`；App Group `<container>/mmkv`；
+  `NSFileManager` 建目录；`NSTemporaryDirectory`。
+- iOS：可写数据/`.crc` 设置
+  `NSFileProtectionCompleteUntilFirstUserAuthentication`；订阅后台/前台/内存警告；
+  初始化时查询 `UIApplicationState`；`.appex` 检测。
+- Linux：显式根目录；`sendfile` 恢复复制。
+- Android：`AndroidPlatform::new(root, cache)`、`from_java(vm, context)`、
+  `from_env()`；`Context.getFilesDir()/mmkv`；进程模式检查（OFD record lock
+  offset 1/2）；legacy `<md5>` 文件迁移；ashmem 区域
+  (`ASharedMemory_create` + `/dev/ashmem` fallback)。
+- Windows：`CreateFileMappingW`/`MapViewOfFile`、`LockFileEx`、页大小、
+  宽字符路径由 `Path` 处理；显式根目录。
 
-## 仍未完成
+## 测试
 
-见 [GAPS.md](GAPS.md)。摘要：
+| 套件 | 数量 | 内容 |
+|---|---|---|
+| `mmkv-core` 单元 | 26 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder |
+| `fixtures.rs` | 9 | C++ v2.4.3 生成的明文/加密/过期文件 |
+| `features.rs` | 16 | 加密往返、C++ 加密追加、rekey、过期迁移/读取即删、备份恢复、多进程刷新、错误 key |
+| `multi_process.rs` | 1 | 两个独立进程并发写 |
+| `roundtrip.rs` | 7 | 明文增长/trim/compare/value size |
+| `apple_platform.rs` | 6 | objc2 路径、页大小、建目录、App Group |
+| 合计 | **65** | |
 
-1. iOS / Linux / Android / Windows 平台 crate。
-2. iOS 文件保护、后台状态、内存警告、App Extension 生命周期。
-3. Android ashmem、进程模式检查、legacy 文件迁移、Context/JNI 默认目录。
-4. 自动空闲实例清理、Apple mmap 磁盘错误检测、原子备份/恢复锁。
-5. NSObject/NSCoding/NSDate 对象 API、`enumerateKeys`。
-6. C ABI / Swift / Kotlin 绑定。
-7. Rust→C++ 的持续差分测试（当前只有 C++→Rust fixtures）、fuzz、benchmark。
-8. 若干性能取舍（加密解码整段临时明文、全量写回重建而非 memmove）。
+跨 target 编译检查：
+
+```bash
+cargo check -p mmkv-rs --target aarch64-apple-ios
+cargo check -p mmkv-rs --target x86_64-unknown-linux-gnu
+cargo check -p mmkv-rs --target aarch64-linux-android
+cargo check -p mmkv-rs --target x86_64-pc-windows-msvc
+```
+
+## 仍需注意
+
+完整差异与理由见 [GAPS.md](GAPS.md)。当前版本的主要剩余项：
+
+- 非 macOS 平台只做了编译验证，未在真机/模拟器运行。
+- Android ashmem 跨进程 FD 传递（ContentProvider/JNI）未实现。
+- Apple mmap 磁盘错误处理为“pread 探测 + 隔离”的近似实现。
+- 无语言绑定、无 CI（按用户要求）。
+- NSObject/NSCoding 等 ObjC 对象 API 不在 Rust API 范围内。

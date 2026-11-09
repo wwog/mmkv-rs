@@ -8,10 +8,9 @@ use std::time::Duration;
 
 use mmkv_core::meta::{MetaInfo, VERSION_RANDOM_IV};
 use mmkv_core::{CryptKey, Mode, Store, StoreConfig};
-use mmkv_platform_macos::MacPlatform;
 
 fn open(root: &Path, id: &str, mode: Mode, key: Option<(&CryptKey, bool)>) -> Arc<Store> {
-    let platform = Arc::new(MacPlatform::new());
+    let platform = mmkv_rs::default_platform();
     let mut config = StoreConfig::new().mode(mode);
     if let Some((key, aes256)) = key {
         config = config.crypt_key(key, aes256);
@@ -213,7 +212,6 @@ fn expiration_enable_and_disable_migrates_values() {
     assert!(store.is_expiration_enabled());
     assert_eq!(store.get_str("a").as_deref(), Some("one"));
     thread::sleep(Duration::from_secs(2));
-    assert_eq!(store.get_str("a"), None);
     assert_eq!(store.count(), 3);
     assert_eq!(store.count_non_expired(), 0);
 
@@ -227,6 +225,28 @@ fn expiration_enable_and_disable_migrates_values() {
     let reopened = open(dir.path(), "expire_migrate", Mode::SINGLE_PROCESS, None);
     assert_eq!(reopened.get_str("b").as_deref(), Some("two"));
     assert_eq!(reopened.count_non_expired(), 3);
+}
+
+#[test]
+fn expired_key_is_deleted_on_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), "expire_read", Mode::SINGLE_PROCESS, None);
+    store.enable_expiration(0).unwrap();
+    store.put_str_expiring("short", "one-second", 1).unwrap();
+    store.put_str_expiring("long", "one-hour", 3_600).unwrap();
+    assert_eq!(store.count(), 2);
+
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(store.get_str("short"), None);
+    // Reading an expired key appends a tombstone (MMKV does the same).
+    assert_eq!(store.count(), 1);
+    store.sync();
+    drop(store);
+
+    let reopened = open(dir.path(), "expire_read", Mode::SINGLE_PROCESS, None);
+    assert_eq!(reopened.count(), 1);
+    assert_eq!(reopened.get_str("short"), None);
+    assert_eq!(reopened.get_str("long").as_deref(), Some("one-hour"));
 }
 
 #[test]
@@ -289,37 +309,49 @@ fn backup_and_restore() {
     special.sync();
     drop(special);
 
+    let platform = mmkv_rs::default_platform();
     assert!(Store::backup_one(
         "backup_plain",
         backup.path(),
-        source.path()
+        source.path(),
+        platform.as_ref()
     ));
     assert!(Store::backup_one(
         "backup_crypt",
         backup.path(),
-        source.path()
+        source.path(),
+        platform.as_ref()
     ));
     assert!(Store::backup_one(
         "backup/a:b",
         backup.path(),
-        source.path()
+        source.path(),
+        platform.as_ref()
     ));
-    assert!(!Store::backup_one("missing", backup.path(), source.path()));
+    assert!(!Store::backup_one(
+        "missing",
+        backup.path(),
+        source.path(),
+        platform.as_ref()
+    ));
 
     assert!(Store::restore_one(
         "backup_plain",
         backup.path(),
-        restored.path()
+        restored.path(),
+        platform.as_ref()
     ));
     assert!(Store::restore_one(
         "backup_crypt",
         backup.path(),
-        restored.path()
+        restored.path(),
+        platform.as_ref()
     ));
     assert!(Store::restore_one(
         "backup/a:b",
         backup.path(),
-        restored.path()
+        restored.path(),
+        platform.as_ref()
     ));
 
     let plain = open(restored.path(), "backup_plain", Mode::SINGLE_PROCESS, None);
@@ -334,9 +366,15 @@ fn backup_and_restore() {
     let special = open(restored.path(), "backup/a:b", Mode::SINGLE_PROCESS, None);
     assert_eq!(special.get_str("key").as_deref(), Some("special"));
 
-    assert_eq!(Store::backup_all(backup.path(), source.path()), 3);
+    assert_eq!(
+        Store::backup_all(backup.path(), source.path(), platform.as_ref()),
+        3
+    );
     let all = tempfile::tempdir().unwrap();
-    assert_eq!(Store::restore_all(backup.path(), all.path()), 3);
+    assert_eq!(
+        Store::restore_all(backup.path(), all.path(), platform.as_ref()),
+        3
+    );
 }
 
 #[test]

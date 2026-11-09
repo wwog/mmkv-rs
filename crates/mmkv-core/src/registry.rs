@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Once, OnceLock, Weak};
 
 use mmkv_platform::{AppEvent, Platform};
 use parking_lot::Mutex;
@@ -25,6 +26,8 @@ struct Global {
 }
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
+static AUTO_CLEANUP_MINUTES: AtomicU32 = AtomicU32::new(0);
+static CLEANUP_STARTED: Once = Once::new();
 
 pub fn is_initialized() -> bool {
     GLOBAL.get().is_some()
@@ -155,6 +158,53 @@ pub fn forget(store: &Store) {
             .unwrap_or(false)
     {
         map.remove(&key);
+    }
+}
+
+/// Enable MMKV's idle-instance cleanup (`enableAutoCleanUp`).
+pub fn enable_auto_cleanup(max_idle_minutes: u32) {
+    AUTO_CLEANUP_MINUTES.store(max_idle_minutes, Ordering::Release);
+    CLEANUP_STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                try_auto_cleanup_instances();
+            }
+        });
+    });
+}
+
+pub fn disable_auto_cleanup() {
+    AUTO_CLEANUP_MINUTES.store(0, Ordering::Release);
+}
+
+/// One cleanup pass. Background apps are skipped (MMKV avoids closing stores
+/// that may wake from suspension).
+pub fn try_auto_cleanup_instances() {
+    let minutes = AUTO_CLEANUP_MINUTES.load(Ordering::Acquire);
+    if minutes == 0 {
+        return;
+    }
+    let Some(global) = GLOBAL.get() else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let threshold = u64::from(minutes) * 60;
+    let stores: Vec<Mmkv> = {
+        let map = global.instances.lock();
+        map.values().filter_map(Weak::upgrade).collect()
+    };
+    for store in stores {
+        if store.is_closed() || store.is_in_background() {
+            continue;
+        }
+        let last = store.last_access_seconds();
+        if last != 0 && now.saturating_sub(last) >= threshold {
+            store.close();
+        }
     }
 }
 

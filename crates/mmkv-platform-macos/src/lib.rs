@@ -1,3 +1,4 @@
+#![cfg(target_vendor = "apple")]
 //! macOS platform integration.
 //!
 //! Foundation is reached through `objc2`/`objc2-foundation`; there is no Swift
@@ -10,7 +11,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use mmkv_platform::{AppState, MappedRegion, Platform};
+use mmkv_platform::{AppState, LockMode, LockOutcome, MappedRegion, Platform};
 use mmkv_platform_posix::PosixMappedRegion;
 use objc2_foundation::{
     NSArray, NSBundle, NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask,
@@ -125,6 +126,19 @@ impl Platform for MacPlatform {
             )
         }
         .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn lock_file(
+        &self,
+        file: &std::fs::File,
+        mode: LockMode,
+        wait: bool,
+    ) -> io::Result<LockOutcome> {
+        mmkv_platform_posix::lock_file(file, mode, wait)
+    }
+
+    fn unlock_file(&self, file: &std::fs::File, mode: LockMode) -> io::Result<()> {
+        mmkv_platform_posix::unlock_file(file, mode)
     }
 
     fn random_bytes(&self, out: &mut [u8]) -> io::Result<()> {

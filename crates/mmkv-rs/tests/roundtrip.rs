@@ -5,10 +5,9 @@
 use std::sync::Arc;
 
 use mmkv_core::{Mode, Store, StoreConfig};
-use mmkv_platform_macos::MacPlatform;
 
 fn open(root: &std::path::Path, id: &str, mode: Mode) -> Arc<Store> {
-    let platform = Arc::new(MacPlatform::new());
+    let platform = mmkv_rs::default_platform();
     Store::open_at(platform, root, id, &StoreConfig::default().mode(mode)).unwrap()
 }
 

@@ -4,9 +4,11 @@
 > 目标：**功能 1:1**、**磁盘格式字节级兼容**、**Rust 风格 API**、**平台分层（GPUI 式）**
 > 本文档只描述方案，不包含实现代码；阶段划分与验收标准见 §6。
 >
-> **实施决策更新（2026-11-09）**：平台目录获取最终使用 **objc2 / objc2-foundation**，不再使用 Swift shim；
-> C++ 参考桥接已从工作区移除，兼容性由 C++ 生成的 **golden fixtures** 持续验证。
-> 下文保留原始方案作为设计记录，其中“Swift shim / C++ bridge”段落仅作历史参考。
+> **实施决策更新（2026-11-09，最终）**：门面 crate 命名为 **`mmkv-rs`**；平台目录获取使用
+> **objc2 / objc2-foundation**，不使用 Swift shim；iOS/Android/Linux/Windows 均已有独立平台 crate；
+> C++ 参考桥接已移除，兼容性由 C++ 生成的 **golden fixtures** 持续验证。
+> 按项目定位（Rust 应用），**不提供 C ABI/Swift/Kotlin/Flutter/Python 包装，也不添加 CI**。
+> 下文保留原始方案作为设计记录，其中“Swift shim / C++ bridge / FFI”段落仅作历史参考。
 
 ---
 
@@ -239,20 +241,20 @@ MMKV 本身**不做** iCloud 备份排除；Rust 移植默认也不做，提供 
 ### 3.1 Crate 依赖图
 
 ```
-mmkv                     门面：init、Mmkv、Namespace、按 cfg 选平台
- ├── mmkv-core            引擎：格式/编解码/加密/store/过期/备份
- │    └── mmkv-platform   契约：Platform/MappedRegion/AppLifecycle/...
- ├── mmkv-platform-macos  ┐
- ├── mmkv-platform-ios    │ 各自实现 Platform
- ├── mmkv-platform-linux  │
- ├── mmkv-platform-android┤
- └── mmkv-platform-windows┘
-        └── mmkv-platform-posix（macos/ios/linux/android 共用）
+mmkv-rs                  门面：init/init_with、Mmkv、Namespace，按 cfg 选平台
+ ├── mmkv-core            引擎：格式/编解码/加密/store/过期/备份/锁/自动清理
+ │    └── mmkv-platform   契约：Platform/MappedRegion/AppLifecycle/FileLockKind
+ ├── mmkv-platform-macos  macOS/tvOS/watchOS/visionOS（objc2）
+ ├── mmkv-platform-ios    iOS（objc2、文件保护、生命周期）
+ ├── mmkv-platform-linux  Linux（POSIX + sendfile）
+ ├── mmkv-platform-android Android（JNI 路径、进程模式、legacy 迁移、ashmem）
+ └── mmkv-platform-windows Windows（CreateFileMappingW/LockFileEx）
+        └── mmkv-platform-posix（macOS/iOS/Linux/Android 共用底层）
 ```
 
 - `mmkv-core` 只依赖 `mmkv-platform` 的 trait，不直接调用 `std::fs` 之外的 OS API。
 - `mmkv` 用 `cfg(target_os)` 选择平台 crate，并 `pub type PlatformImpl = ...`；也允许用户直接依赖 `mmkv-core` + 自定义 `Platform`。
-- 后续 `mmkv-ffi` 只依赖 `mmkv`，不把 C ABI 混进核心。
+- 语言绑定与 CI 不在本项目范围内（按用户决策）。
 
 ### 3.2 `mmkv-platform` 契约
 

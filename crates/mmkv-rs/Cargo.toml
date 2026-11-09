@@ -8,10 +8,22 @@ license.workspace = true
 mmkv-core.workspace = true
 mmkv-platform.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "tvos", target_os = "watchos", target_os = "visionos"))'.dependencies]
 mmkv-platform-macos.workspace = true
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "ios")'.dependencies]
+mmkv-platform-ios.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mmkv-platform-linux.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+mmkv-platform-android.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mmkv-platform-windows.workspace = true
+
+[target.'cfg(not(any(target_os = "macos", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "ios", target_os = "linux", target_os = "android", target_os = "windows")))'.dependencies]
 mmkv-platform-posix.workspace = true
 
 [dev-dependencies]

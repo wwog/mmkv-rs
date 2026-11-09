@@ -1,11 +1,14 @@
 //! Static store administration: validity checks, removal, backup/restore.
 //!
-//! These mirror `MMKV::isFileValid`, `checkExist`, `removeStorage`,
-//! `backupOneToDirectory` and friends.
+//! Mirrors `MMKV::isFileValid`, `checkExist`, `removeStorage`,
+//! `backupOneToDirectory` and friends, including the `.crc` `flock` used by the
+//! C++ implementation around backup/restore/removal.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
+
+use mmkv_platform::{LockMode, Platform};
 
 use crate::crc32::crc32;
 use crate::error::Result;
@@ -60,13 +63,23 @@ impl super::Store {
         kv_path.exists() && crc_path(&kv_path).exists()
     }
 
-    /// `removeStorage`: unlink the data and meta files.
-    pub fn remove_storage(id: &str, root: &Path) -> Result<bool> {
+    /// `removeStorage`: close any cached instance, take the `.crc` exclusive
+    /// lock, then unlink the data and meta files.
+    pub fn remove_storage(id: &str, root: &Path, platform: &dyn Platform) -> Result<bool> {
         crate::registry::close_instance(id, root);
         let kv_path = mapped_kv_path(root, id);
         let crc_path = crc_path(&kv_path);
         if !kv_path.exists() && !crc_path.exists() {
             return Ok(false);
+        }
+
+        let lock_file = if crc_path.exists() {
+            OpenOptions::new().read(true).open(&crc_path).ok()
+        } else {
+            None
+        };
+        if let Some(file) = &lock_file {
+            let _ = platform.lock_file(file, LockMode::Exclusive, true);
         }
         if kv_path.exists() {
             fs::remove_file(&kv_path)?;
@@ -74,31 +87,37 @@ impl super::Store {
         if crc_path.exists() {
             fs::remove_file(&crc_path)?;
         }
+        drop(lock_file);
         Ok(true)
     }
 
-    pub fn backup_one(id: &str, dst_dir: &Path, src_root: &Path) -> bool {
+    pub fn backup_one(id: &str, dst_dir: &Path, src_root: &Path, platform: &dyn Platform) -> bool {
         let source = mapped_kv_path(src_root, id);
         let destination = dst_dir.join(encode_file_path(id));
-        copy_pair(&source, &destination).is_ok()
+        copy_pair_locked(&source, &destination, platform, false).is_ok()
     }
 
-    pub fn restore_one(id: &str, src_dir: &Path, dst_root: &Path) -> bool {
+    pub fn restore_one(id: &str, src_dir: &Path, dst_root: &Path, platform: &dyn Platform) -> bool {
         let source = src_dir.join(encode_file_path(id));
         let destination = mapped_kv_path(dst_root, id);
-        copy_pair(&source, &destination).is_ok()
+        copy_pair_locked(&source, &destination, platform, true).is_ok()
     }
 
-    pub fn backup_all(dst_dir: &Path, src_root: &Path) -> usize {
-        copy_tree(src_root, dst_dir)
+    pub fn backup_all(dst_dir: &Path, src_root: &Path, platform: &dyn Platform) -> usize {
+        copy_tree(src_root, dst_dir, platform, false)
     }
 
-    pub fn restore_all(src_dir: &Path, dst_root: &Path) -> usize {
-        copy_tree(src_dir, dst_root)
+    pub fn restore_all(src_dir: &Path, dst_root: &Path, platform: &dyn Platform) -> usize {
+        copy_tree(src_dir, dst_root, platform, true)
     }
 }
 
-fn copy_pair(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_pair_locked(
+    source: &Path,
+    destination: &Path,
+    platform: &dyn Platform,
+    restore: bool,
+) -> io::Result<()> {
     if !source.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -108,15 +127,46 @@ fn copy_pair(source: &Path, destination: &Path) -> io::Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source, destination)?;
+
     let source_crc = crc_path(source);
-    if source_crc.exists() {
-        fs::copy(&source_crc, crc_path(destination))?;
+    let destination_crc = crc_path(destination);
+
+    // Backup locks the source `.crc` shared; restore locks the destination
+    // `.crc` exclusive, matching MMKV.
+    let lock_file = if restore {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&destination_crc)
+            .ok()
+    } else {
+        File::open(&source_crc).ok()
+    };
+    if let Some(file) = &lock_file {
+        let mode = if restore {
+            LockMode::Exclusive
+        } else {
+            LockMode::Shared
+        };
+        platform.lock_file(file, mode, true)?;
     }
+
+    platform.copy_file(source, destination, restore)?;
+    if source_crc.exists() {
+        platform.copy_file(&source_crc, &destination_crc, restore)?;
+    }
+    drop(lock_file);
     Ok(())
 }
 
-fn copy_tree(source_dir: &Path, destination_dir: &Path) -> usize {
+fn copy_tree(
+    source_dir: &Path,
+    destination_dir: &Path,
+    platform: &dyn Platform,
+    restore: bool,
+) -> usize {
     let Ok(entries) = fs::read_dir(source_dir) else {
         return 0;
     };
@@ -131,14 +181,14 @@ fn copy_tree(source_dir: &Path, destination_dir: &Path) -> usize {
         };
         if file_type.is_dir() {
             if name == SPECIAL_CHARACTER_DIRECTORY_NAME {
-                count += copy_tree(&path, &destination_dir.join(name));
+                count += copy_tree(&path, &destination_dir.join(name), platform, restore);
             }
             continue;
         }
         if name.ends_with(".crc") {
             continue;
         }
-        if copy_pair(&path, &destination_dir.join(name)).is_ok() {
+        if copy_pair_locked(&path, &destination_dir.join(name), platform, restore).is_ok() {
             count += 1;
         }
     }

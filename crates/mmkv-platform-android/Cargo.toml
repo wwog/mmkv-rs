@@ -1,0 +1,15 @@
+[package]
+name = "mmkv-platform-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mmkv-platform.workspace = true
+mmkv-platform-posix.workspace = true
+libc.workspace = true
+md-5.workspace = true
+memmap2.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true

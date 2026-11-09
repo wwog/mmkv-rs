@@ -1,0 +1,12 @@
+[package]
+name = "mmkv-platform-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mmkv-platform.workspace = true
+mmkv-platform-posix.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+block2.workspace = true

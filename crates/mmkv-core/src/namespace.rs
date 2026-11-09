@@ -45,23 +45,23 @@ impl Namespace {
     }
 
     pub fn remove_storage(&self, id: &str) -> Result<bool> {
-        Store::remove_storage(id, &self.root)
+        Store::remove_storage(id, &self.root, self.platform.as_ref())
     }
 
     pub fn backup_one(&self, id: &str, dst_dir: &Path) -> bool {
-        Store::backup_one(id, dst_dir, &self.root)
+        Store::backup_one(id, dst_dir, &self.root, self.platform.as_ref())
     }
 
     pub fn restore_one(&self, id: &str, src_dir: &Path) -> bool {
-        Store::restore_one(id, src_dir, &self.root)
+        Store::restore_one(id, src_dir, &self.root, self.platform.as_ref())
     }
 
     pub fn backup_all(&self, dst_dir: &Path) -> usize {
-        Store::backup_all(dst_dir, &self.root)
+        Store::backup_all(dst_dir, &self.root, self.platform.as_ref())
     }
 
     pub fn restore_all(&self, src_dir: &Path) -> usize {
-        Store::restore_all(src_dir, &self.root)
+        Store::restore_all(src_dir, &self.root, self.platform.as_ref())
     }
 }
 

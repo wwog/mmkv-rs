@@ -23,12 +23,31 @@ impl MemoryFile {
         let page_size = platform.page_size();
         let expected = initial_capacity(expected_capacity, page_size);
         let region = platform.open_region(path, expected, read_only, mayfly_fd)?;
+        if !read_only {
+            // iOS upgrades writable data and `.crc` files to
+            // NSFileProtectionCompleteUntilFirstUserAuthentication.
+            let _ = platform.protect_file(path);
+        }
         Ok(Self {
             region,
             read_only,
             page_size,
             path: path.to_path_buf(),
         })
+    }
+
+    pub fn from_region(
+        region: Box<dyn MappedRegion>,
+        read_only: bool,
+        page_size: usize,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            region,
+            read_only,
+            page_size,
+            path,
+        }
     }
 
     pub fn size(&self) -> usize {

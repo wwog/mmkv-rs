@@ -31,6 +31,7 @@ pub enum Error {
     ItemSizeLimit { size: usize, limit: u32 },
     Unsupported(&'static str),
     LockBusy,
+    ProcessModeMismatch,
 }
 
 impl fmt::Display for Error {
@@ -51,6 +52,9 @@ impl fmt::Display for Error {
             }
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::LockBusy => write!(f, "MMKV file lock is busy"),
+            Error::ProcessModeMismatch => {
+                write!(f, "MMKV single-process/multi-process mode mismatch")
+            }
         }
     }
 }

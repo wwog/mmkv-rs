@@ -8,14 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mmkv_core::{CryptKey, Mode, Store, StoreConfig};
-use mmkv_platform_macos::MacPlatform;
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 fn open(id: &str, mode: Mode, key: Option<(&CryptKey, bool)>) -> Arc<Store> {
-    let platform = Arc::new(MacPlatform::new());
+    let platform = mmkv_rs::default_platform();
     let mut config = StoreConfig::new().mode(mode);
     if let Some((key, aes256)) = key {
         config = config.crypt_key(key, aes256);

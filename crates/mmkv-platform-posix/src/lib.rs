@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Shared POSIX implementation of the MMKV platform contract.
 //!
 //! Contains the portable file mapping and advisory locking primitives used by
@@ -338,6 +339,14 @@ impl Platform for PosixPlatform {
         open_region(path, expected_size, read_only, mayfly_fd, self.page_size)
     }
 
+    fn lock_file(&self, file: &File, mode: LockMode, wait: bool) -> io::Result<LockOutcome> {
+        lock_file(file, mode, wait)
+    }
+
+    fn unlock_file(&self, file: &File, mode: LockMode) -> io::Result<()> {
+        unlock_file(file, mode)
+    }
+
     fn random_bytes(&self, out: &mut [u8]) -> io::Result<()> {
         random_bytes(out)
     }
@@ -348,6 +357,36 @@ impl Platform for PosixPlatform {
 
     fn app_state(&self) -> AppState {
         AppState::Foreground
+    }
+}
+
+pub fn lock_file(file: &File, mode: LockMode, wait: bool) -> io::Result<LockOutcome> {
+    let base = match mode {
+        LockMode::Shared => libc::LOCK_SH,
+        LockMode::Exclusive => libc::LOCK_EX,
+    };
+    let op = if wait { base } else { base | libc::LOCK_NB };
+    // SAFETY: plain libc call with a valid descriptor.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), op) };
+    if ret == 0 {
+        return Ok(LockOutcome::Acquired);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+            Ok(LockOutcome::WouldBlock)
+        }
+        _ => Err(err),
+    }
+}
+
+pub fn unlock_file(file: &File, _mode: LockMode) -> io::Result<()> {
+    // SAFETY: plain libc call with a valid descriptor.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 

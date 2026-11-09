@@ -1,3 +1,5 @@
+#![cfg(target_vendor = "apple")]
+
 //! Verifies the `objc2` implementation exposes the same Foundation paths and
 //! behaviour MMKV uses on Apple platforms.
 

@@ -1,15 +1,16 @@
 //! Recursive shared/exclusive inter-process lock, a port of
-//! `InterProcessLock`/`FileLock` on top of `flock(2)`.
+//! `InterProcessLock`/`FileLock`.
 //!
 //! MMKV locks the `.crc` file descriptor. We `dup` that descriptor, so the
-//! `flock` lock is attached to the same open file description and interoperates
-//! with the C++ implementation.
+//! lock is attached to the same open file description and interoperates with
+//! the C++ implementation. The actual primitive is supplied by the platform
+//! (`flock` on POSIX, `LockFileEx` on Windows).
 
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
-use mmkv_platform::{LockMode, LockOutcome};
+use mmkv_platform::{FileLockKind, LockMode, LockOutcome, Platform};
 use parking_lot::Mutex;
 
 #[derive(Default)]
@@ -19,7 +20,9 @@ struct Counts {
 }
 
 pub struct FileLock {
+    platform: Option<Arc<dyn Platform>>,
     file: Option<File>,
+    kind: FileLockKind,
     enabled: bool,
     counts: Mutex<Counts>,
 }
@@ -27,15 +30,23 @@ pub struct FileLock {
 impl FileLock {
     pub fn disabled() -> Self {
         Self {
+            platform: None,
             file: None,
+            kind: FileLockKind::Advisory,
             enabled: false,
             counts: Mutex::new(Counts::default()),
         }
     }
 
-    pub fn new(file: File) -> Self {
+    pub fn new(platform: Arc<dyn Platform>, file: File) -> Self {
+        Self::new_with_kind(platform, file, FileLockKind::Advisory)
+    }
+
+    pub fn new_with_kind(platform: Arc<dyn Platform>, file: File, kind: FileLockKind) -> Self {
         Self {
+            platform: Some(platform),
             file: Some(file),
+            kind,
             enabled: true,
             counts: Mutex::new(Counts::default()),
         }
@@ -46,41 +57,27 @@ impl FileLock {
     }
 
     fn flock(&self, mode: LockMode, wait: bool) -> io::Result<LockOutcome> {
+        let platform = self
+            .platform
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
         let file = self
             .file
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
-        let base = match mode {
-            LockMode::Shared => libc::LOCK_SH,
-            LockMode::Exclusive => libc::LOCK_EX,
-        };
-        let operation = if wait { base } else { base | libc::LOCK_NB };
-        // SAFETY: plain libc call with a valid descriptor.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), operation) };
-        if ret == 0 {
-            return Ok(LockOutcome::Acquired);
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                Ok(LockOutcome::WouldBlock)
-            }
-            _ => Err(err),
-        }
+        platform.lock_file_kind(file, mode, wait, self.kind)
     }
 
-    fn funlock(&self) -> io::Result<()> {
+    fn funlock(&self, mode: LockMode) -> io::Result<()> {
+        let platform = self
+            .platform
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
         let file = self
             .file
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
-        // SAFETY: plain libc call with a valid descriptor.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        platform.unlock_file_kind(file, mode, self.kind)
     }
 
     pub fn lock(&self, mode: LockMode) -> io::Result<()> {
@@ -106,7 +103,7 @@ impl FileLock {
                     match self.flock(LockMode::Exclusive, false)? {
                         LockOutcome::Acquired => {}
                         LockOutcome::WouldBlock => {
-                            self.funlock()?;
+                            self.funlock(LockMode::Exclusive)?;
                             if let Err(err) = self.flock(LockMode::Exclusive, true) {
                                 let _ = self.flock(LockMode::Shared, true);
                                 return Err(err);
@@ -174,7 +171,7 @@ impl FileLock {
                 }
                 counts.shared -= 1;
                 if counts.shared == 0 && counts.exclusive == 0 {
-                    let _ = self.funlock();
+                    let _ = self.funlock(LockMode::Exclusive);
                 }
             }
             LockMode::Exclusive => {
@@ -187,7 +184,7 @@ impl FileLock {
                         // Downgrade: flock(LOCK_SH) converts the lock.
                         let _ = self.flock(LockMode::Shared, true);
                     } else {
-                        let _ = self.funlock();
+                        let _ = self.funlock(LockMode::Exclusive);
                     }
                 }
             }
