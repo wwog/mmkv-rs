@@ -1,0 +1,11 @@
+[package]
+name = "mmkv-platform-posix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mmkv-platform.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+getrandom.workspace = true

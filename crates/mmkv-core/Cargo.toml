@@ -1,0 +1,16 @@
+[package]
+name = "mmkv-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mmkv-platform.workspace = true
+parking_lot.workspace = true
+md-5.workspace = true
+libc.workspace = true
+aes.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+mmkv-platform-posix.workspace = true
