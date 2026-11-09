@@ -74,7 +74,7 @@ pub struct Store {
     mode: Mode,
     platform: Arc<dyn Platform>,
     lock: FileLock,
-    _process_mode_guard: Option<Box<dyn Send + Sync>>,
+    process_mode_guard: Mutex<Option<Box<dyn Send + Sync>>>,
     last_access: AtomicU64,
     inner: Mutex<Inner>,
 }
@@ -169,10 +169,11 @@ impl Store {
                 mode: config.mode,
                 platform,
                 lock,
-                _process_mode_guard: None,
+                process_mode_guard: Mutex::new(None),
                 last_access: AtomicU64::new(0),
                 inner: Mutex::new(inner),
             });
+            store.touch();
             {
                 let mut inner = store.inner.lock();
                 if let Some(expiration) = config.expiration {
@@ -187,7 +188,9 @@ impl Store {
             return Ok(store);
         }
 
-        platform.migrate_legacy_store(&root, &id)?;
+        if !read_only {
+            platform.migrate_legacy_store(&root, &id)?;
+        }
 
         if !read_only {
             platform.create_dir_all(&root)?;
@@ -222,8 +225,11 @@ impl Store {
             FileLock::disabled()
         };
 
-        let (process_mode_ok, process_mode_guard) =
-            platform.check_process_mode(&crc_path, multi_process)?;
+        let (process_mode_ok, process_mode_guard) = if read_only {
+            (true, None)
+        } else {
+            platform.check_process_mode(&crc_path, multi_process)?
+        };
         if !process_mode_ok {
             return Err(Error::ProcessModeMismatch);
         }
@@ -276,10 +282,11 @@ impl Store {
             mode: config.mode,
             platform,
             lock,
-            _process_mode_guard: process_mode_guard,
+            process_mode_guard: Mutex::new(process_mode_guard),
             last_access: AtomicU64::new(0),
             inner: Mutex::new(inner),
         });
+        store.touch();
 
         {
             let mut inner = store.inner.lock();
@@ -367,11 +374,11 @@ impl Store {
         if inner.closed {
             return Err(Error::Closed);
         }
-        let _guard = self.lock.exclusive_guard()?;
-        self.ensure_loaded_locked(&mut inner)?;
         if inner.read_only {
             return Err(Error::ReadOnly);
         }
+        let _guard = self.lock.exclusive_guard()?;
+        self.ensure_loaded_locked(&mut inner)?;
 
         match (inner.crypter.as_ref(), key) {
             (Some(crypter), Some(key)) if crypter.matches_key(key.as_bytes(), aes256) => {
@@ -422,10 +429,13 @@ impl Store {
     /// `Error::Closed` afterwards.
     pub fn close(&self) {
         crate::registry::forget(self);
+        self.lock.release_all();
+        let _ = self.process_mode_guard.lock().take();
         let mut inner = self.inner.lock();
         inner.closed = true;
         inner.dict.clear();
         inner.dict_crypt.clear();
+        inner.crypter = None;
         inner.data = None;
         inner.need_load = true;
         inner.actual_size = 0;
@@ -444,17 +454,28 @@ impl Store {
             }
         }
         if inner.data.is_none() {
-            if inner.read_only {
-                inner.need_load = false;
-                return Ok(());
-            }
-            inner.data = Some(MemoryFile::open(
+            match MemoryFile::open(
                 self.platform.as_ref(),
                 &self.path,
                 inner.expected_capacity,
-                false,
+                inner.read_only,
                 true,
-            )?);
+            ) {
+                Ok(file) => inner.data = Some(file),
+                Err(err) => {
+                    if inner.read_only {
+                        // Missing/invalid data file in read-only mode: behave
+                        // like MMKV's empty instance instead of failing the load.
+                        inner.dict.clear();
+                        inner.dict_crypt.clear();
+                        inner.actual_size = 0;
+                        inner.output_position = 0;
+                        inner.need_load = false;
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+            }
         }
 
         let mut meta_info =
@@ -514,6 +535,7 @@ impl Store {
 
         inner.meta_info = meta_info;
         inner.crc_digest = inner.meta_info.crc_digest;
+        inner.has_full_writeback = false;
 
         if let Some(crypter) = inner.crypter.as_mut() {
             let iv = if inner.meta_info.version >= meta::VERSION_RANDOM_IV {
@@ -572,6 +594,7 @@ impl Store {
                     .set_status(&status);
                 inner.actual_size = actual_size;
                 inner.output_position = actual_size;
+                inner.need_load = false;
                 let upgrade_iv = inner.meta_info.version < meta::VERSION_RANDOM_IV;
                 if (need_full_writeback || upgrade_iv) && !inner.read_only {
                     self.full_writeback_locked(inner)?;
@@ -603,6 +626,7 @@ impl Store {
                 apply_entries(&mut inner.dict, entries);
                 inner.actual_size = actual_size;
                 inner.output_position = actual_size;
+                inner.need_load = false;
                 if need_full_writeback && !inner.read_only {
                     self.full_writeback_locked(inner)?;
                 }
@@ -612,7 +636,9 @@ impl Store {
             inner.dict_crypt.clear();
             inner.actual_size = 0;
             inner.output_position = 0;
+            inner.need_load = false;
             if !inner.read_only {
+                let _guard = self.lock.exclusive_guard()?;
                 if actual_size > 0 {
                     self.write_actual_size_locked(inner, 0, 0, true, None)?;
                     self.sync_locked(inner, SyncMode::Sync)?;
@@ -932,6 +958,12 @@ impl Store {
             return Err(Error::InvalidId(key.to_owned()));
         }
         let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(Error::Closed);
+        }
+        if inner.read_only {
+            return Err(Error::ReadOnly);
+        }
         // Acquire the exclusive process lock *before* refreshing from disk, so
         // another process cannot append between the refresh and our write.
         let _guard = self.lock.exclusive_guard()?;
@@ -1455,9 +1487,10 @@ impl Store {
                 .ok_or(Error::Unsupported("encryption is not enabled"))?;
             let mut entries = Vec::with_capacity(inner.dict_crypt.len());
             for (key, holder) in &inner.dict_crypt {
-                if let Some(value) = holder.value(payload, crypter) {
-                    entries.push((key.clone(), value));
-                }
+                let value = holder
+                    .value(payload, crypter)
+                    .ok_or(Error::Corrupted(CorruptKind::Length))?;
+                entries.push((key.clone(), value));
             }
             entries
         };
@@ -1518,8 +1551,8 @@ impl Store {
             .bytes_mut()[FIXED32_SIZE..FIXED32_SIZE + ITEM_SIZE_HOLDER_SIZE]
             .copy_from_slice(&placeholder);
 
-        inner.dict.clear();
-        inner.dict_crypt.clear();
+        let mut new_dict = Dictionary::new();
+        let mut new_dict_crypt = CryptDictionary::new();
         let mut offset = ITEM_SIZE_HOLDER_SIZE as u32;
         for (key, value) in entries {
             let value_len = value.len() as u32;
@@ -1555,7 +1588,7 @@ impl Store {
                 } else {
                     KeyValueHolderCrypt::from_value(&value)
                 };
-                inner.dict_crypt.insert(key, holder);
+                new_dict_crypt.insert(key, holder);
             } else {
                 let holder =
                     KeyValueHolder::new(key.len() as u32, value_len, offset).ok_or_else(|| {
@@ -1564,7 +1597,7 @@ impl Store {
                             size: value_len as usize,
                         }
                     })?;
-                inner.dict.insert(key, holder);
+                new_dict.insert(key, holder);
             }
             offset += entry_size as u32;
         }
@@ -1575,6 +1608,8 @@ impl Store {
             let bytes = data.bytes();
             crc32(0, &bytes[FIXED32_SIZE..FIXED32_SIZE + total])
         };
+        inner.dict = new_dict;
+        inner.dict_crypt = new_dict_crypt;
         inner.actual_size = total;
         inner.output_position = total;
         let iv = if encrypted { Some(&iv) } else { None };
@@ -1614,6 +1649,7 @@ impl Store {
         if inner.read_only {
             return Err(Error::ReadOnly);
         }
+        let _guard = self.lock.exclusive_guard()?;
         if inner.expiration_enabled {
             self.filter_expired_locked(inner);
         }
@@ -1727,6 +1763,7 @@ impl Store {
         inner.output_position = 0;
         inner.crc_digest = 0;
         inner.need_load = true;
+        inner.has_full_writeback = false;
         if !keep_space {
             inner.data = None;
         }
@@ -1750,6 +1787,9 @@ impl Store {
         let mut inner = self.inner.lock();
         if inner.closed {
             return Err(Error::Closed);
+        }
+        if inner.read_only {
+            return Err(Error::ReadOnly);
         }
         let _guard = self.lock.exclusive_guard()?;
         self.ensure_loaded_locked(&mut inner)?;
@@ -1933,12 +1973,20 @@ impl Store {
         }
     }
 
+    pub fn get_bytes_or(&self, key: &str, default: &[u8]) -> Vec<u8> {
+        self.get_bytes(key).unwrap_or_else(|| default.to_vec())
+    }
+
     pub fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
         let blob = self
             .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
             .ok()
             .flatten()?;
         mini_pb::decode_bytes(&blob).ok().map(<[u8]>::to_vec)
+    }
+
+    pub fn get_strings_or(&self, key: &str, default: &[String]) -> Vec<String> {
+        self.get_strings(key).unwrap_or_else(|| default.to_vec())
     }
 
     pub fn get_strings(&self, key: &str) -> Option<Vec<String>> {
@@ -2233,32 +2281,69 @@ impl Store {
         self.put_blob(key, &mini_pb::encode_strings(values), false, None)
     }
 
+    pub fn put_strings_expiring<S: AsRef<str>>(
+        &self,
+        key: &str,
+        values: &[S],
+        seconds: u32,
+    ) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_strings(values), false, Some(seconds))
+    }
+
     pub fn put_bool_vec(&self, key: &str, values: &[bool]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_bool_vec(values), false, None)
+    }
+
+    pub fn put_bool_vec_expiring(&self, key: &str, values: &[bool], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_bool_vec(values), false, Some(seconds))
     }
 
     pub fn put_i32_vec(&self, key: &str, values: &[i32]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_i32_vec(values), false, None)
     }
 
+    pub fn put_i32_vec_expiring(&self, key: &str, values: &[i32], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_i32_vec(values), false, Some(seconds))
+    }
+
     pub fn put_u32_vec(&self, key: &str, values: &[u32]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_u32_vec(values), false, None)
+    }
+
+    pub fn put_u32_vec_expiring(&self, key: &str, values: &[u32], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_u32_vec(values), false, Some(seconds))
     }
 
     pub fn put_i64_vec(&self, key: &str, values: &[i64]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_i64_vec(values), false, None)
     }
 
+    pub fn put_i64_vec_expiring(&self, key: &str, values: &[i64], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_i64_vec(values), false, Some(seconds))
+    }
+
     pub fn put_u64_vec(&self, key: &str, values: &[u64]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_u64_vec(values), false, None)
+    }
+
+    pub fn put_u64_vec_expiring(&self, key: &str, values: &[u64], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_u64_vec(values), false, Some(seconds))
     }
 
     pub fn put_f32_vec(&self, key: &str, values: &[f32]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_f32_vec(values), false, None)
     }
 
+    pub fn put_f32_vec_expiring(&self, key: &str, values: &[f32], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_f32_vec(values), false, Some(seconds))
+    }
+
     pub fn put_f64_vec(&self, key: &str, values: &[f64]) -> Result<()> {
         self.put_blob(key, &mini_pb::encode_f64_vec(values), false, None)
+    }
+
+    pub fn put_f64_vec_expiring(&self, key: &str, values: &[f64], seconds: u32) -> Result<()> {
+        self.put_blob(key, &mini_pb::encode_f64_vec(values), false, Some(seconds))
     }
 
     pub fn remove(&self, key: &str) -> Result<bool> {
@@ -2296,11 +2381,11 @@ impl Store {
         if inner.closed {
             return Err(Error::Closed);
         }
-        let _guard = self.lock.exclusive_guard()?;
-        self.ensure_loaded_locked(&mut inner)?;
         if inner.read_only {
             return Err(Error::ReadOnly);
         }
+        let _guard = self.lock.exclusive_guard()?;
+        self.ensure_loaded_locked(&mut inner)?;
         if inner.actual_size == 0 {
             return self.clear_all_locked(&mut inner, false);
         }
@@ -2346,7 +2431,11 @@ impl Store {
         if inner.closed {
             return Err(Error::Closed);
         }
-        let _guard = self.lock.exclusive_guard()?;
+        let _guard = if inner.read_only {
+            self.lock.shared_guard()?
+        } else {
+            self.lock.exclusive_guard()?
+        };
         self.ensure_loaded_locked(&mut inner)?;
         self.sync_locked(&mut inner, mode)
     }
@@ -2357,11 +2446,17 @@ impl Store {
     }
 
     pub fn lock(&self) -> Result<StoreLockGuard<'_>> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         let guard = self.lock.exclusive_guard()?;
         Ok(StoreLockGuard { _guard: guard })
     }
 
     pub fn try_lock(&self) -> Option<StoreLockGuard<'_>> {
+        if self.is_closed() {
+            return None;
+        }
         match self.lock.try_exclusive_guard() {
             Ok(Some(guard)) => Some(StoreLockGuard { _guard: guard }),
             _ => None,
@@ -2371,6 +2466,10 @@ impl Store {
     // ── expiration ──────────────────────────────────────────────────────
 
     fn configure_expiration_locked(&self, inner: &mut Inner, expiration: Expiration) -> Result<()> {
+        if inner.read_only {
+            inner.expired_in_seconds = expiration.seconds();
+            return Ok(());
+        }
         match expiration {
             Expiration::PerKey => self.enable_expiration_locked(inner, 0),
             Expiration::After(seconds) => self.enable_expiration_locked(inner, seconds),
@@ -2453,9 +2552,10 @@ impl Store {
         };
         let mut entries = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(value) = self.value_blob_raw(inner, &key) {
-                entries.push((key, value));
-            }
+            let value = self
+                .value_blob_raw(inner, &key)
+                .ok_or(Error::Corrupted(CorruptKind::Length))?;
+            entries.push((key, value));
         }
         Ok(entries)
     }
@@ -2534,8 +2634,16 @@ impl Store {
 
         let mut first_inner = first.inner.lock();
         let mut second_inner = second.inner.lock();
-        let _first_guard = first.lock.exclusive_guard()?;
-        let _second_guard = second.lock.exclusive_guard()?;
+        let _first_guard = if first.mode.is_read_only() {
+            first.lock.shared_guard()?
+        } else {
+            first.lock.exclusive_guard()?
+        };
+        let _second_guard = if second.mode.is_read_only() {
+            second.lock.shared_guard()?
+        } else {
+            second.lock.exclusive_guard()?
+        };
         first.ensure_loaded_locked(&mut first_inner)?;
         second.ensure_loaded_locked(&mut second_inner)?;
 
@@ -2603,7 +2711,9 @@ fn recover_unreadable(path: &Path) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
-            let quarantine = path.with_extension(format!("corrupt.{stamp}"));
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!(".corrupt.{stamp}"));
+            let quarantine = PathBuf::from(name);
             mmkv_log!(
                 crate::handler::Level::Warning,
                 "MMKV file [{}] is unreadable ({}), moving to {}",

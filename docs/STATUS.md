@@ -2,7 +2,7 @@
 
 > 最后更新：2026-11-09
 > 版本：`mmkv-rs` 0.1.0
-> 验证：**65 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
+> 验证：**68 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
 > 说明：本项目面向 Rust 应用，不包含语言绑定；CI 按用户要求未添加。
 
 ## 平台矩阵
@@ -94,11 +94,11 @@
 |---|---|---|
 | `mmkv-core` 单元 | 26 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder |
 | `fixtures.rs` | 9 | C++ v2.4.3 生成的明文/加密/过期文件 |
-| `features.rs` | 16 | 加密往返、C++ 加密追加、rekey、过期迁移/读取即删、备份恢复、多进程刷新、错误 key |
+| `features.rs` | 19 | 加密往返、C++ 加密追加、rekey、过期迁移/读取即删、备份恢复、多进程刷新、错误 key |
 | `multi_process.rs` | 1 | 两个独立进程并发写 |
 | `roundtrip.rs` | 7 | 明文增长/trim/compare/value size |
 | `apple_platform.rs` | 6 | objc2 路径、页大小、建目录、App Group |
-| 合计 | **65** | |
+| 合计 | **68** | |
 
 跨 target 编译检查：
 

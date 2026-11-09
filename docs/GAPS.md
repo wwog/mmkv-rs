@@ -97,7 +97,21 @@
 - 没有 Windows/Linux/Android/iOS 运行期测试。
 - 多进程压力测试只覆盖普通追加；未覆盖跨进程 trim/clear/backup/restore 竞争。
 
-## 10. 明确不做（按用户范围）
+## 10. Rust 适配性剩余项
+
+详细分析见 [REVIEW.md](REVIEW.md) §2。
+
+| # | 项 | 说明 |
+|---|---|---|
+| 10.1 | Handler 重入 | `log`/CRC/`on_content_loaded`/`on_content_changed` 可能在持有 store 内部 `Mutex` 时执行；handler 同线程回调同一 store 会死锁。需要锁外通知或文档约束。 |
+| 10.2 | Getter 隐藏错误 | `get_*`/`count`/`all_keys` 将 Closed/IO/解码错误折叠为 None/0/空；建议增加 `try_*`。 |
+| 10.3 | void mutator | `clear`/`trim`/`sync`/`sync_async`/`clear_memory_cache`/`check_content_changed` 吞掉错误；建议返回 `Result` 或增加 `try_*`。 |
+| 10.4 | 核心静态 API | `remove_storage`/backup/restore 需要 `&dyn Platform`，与 `is_file_valid`/`exists` 不一致；建议 `StoreAdmin` 或 `*_unlocked`。 |
+| 10.5 | `open_at` 与 `config.root` | `open_at` 忽略 `config.root`（Namespace 语义）；建议 debug assert/文档。 |
+| 10.6 | `close(&self)` | 不消费句柄；其他 Arc 克隆返回 Closed，与 C++ delete 语义不同。 |
+| 10.7 | 零拷贝/非 UTF-8 | `with_bytes`/`with_str` 仍复制；公开 key 仅 `&str`。 |
+
+## 11. 明确不做（按用户范围）
 
 - 所有语言包装（C ABI、Swift、Kotlin、Flutter、Python、KMP）。
 - CI 配置。

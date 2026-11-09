@@ -74,7 +74,11 @@ impl super::Store {
         }
 
         let lock_file = if crc_path.exists() {
-            OpenOptions::new().read(true).open(&crc_path).ok()
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&crc_path)
+                .ok()
         } else {
             None
         };
@@ -130,6 +134,12 @@ fn copy_pair_locked(
 
     let source_crc = crc_path(source);
     let destination_crc = crc_path(destination);
+    if !source_crc.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing MMKV meta file: {}", source_crc.display()),
+        ));
+    }
 
     // Backup locks the source `.crc` shared; restore locks the destination
     // `.crc` exclusive, matching MMKV.
@@ -154,9 +164,7 @@ fn copy_pair_locked(
     }
 
     platform.copy_file(source, destination, restore)?;
-    if source_crc.exists() {
-        platform.copy_file(&source_crc, &destination_crc, restore)?;
-    }
+    platform.copy_file(&source_crc, &destination_crc, restore)?;
     drop(lock_file);
     Ok(())
 }

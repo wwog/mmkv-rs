@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Once, OnceLock, Weak};
 
 use mmkv_platform::{AppEvent, Platform};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 
 use crate::config::StoreConfig;
 use crate::error::{Error, Result};
@@ -23,6 +23,9 @@ struct Global {
     platform: Arc<dyn Platform>,
     root: PathBuf,
     instances: Mutex<HashMap<String, Weak<Store>>>,
+    /// Serializes construction without deadlocking on re-entrant opens from a
+    /// handler callback (the same thread may re-enter).
+    opening: ReentrantMutex<()>,
 }
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
@@ -74,6 +77,7 @@ pub fn init(
         platform,
         root,
         instances: Mutex::new(HashMap::new()),
+        opening: ReentrantMutex::new(()),
     };
     let root = global.root.clone();
     let _ = GLOBAL.set(global);
@@ -127,21 +131,37 @@ fn open_registered(
 ) -> Result<Mmkv> {
     let key = registry_key(root, id);
     if let Some(global) = GLOBAL.get() {
-        let mut map = global.instances.lock();
-        if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
-            if existing.is_closed() {
-                map.remove(&key);
-            } else {
-                return Ok(existing);
+        // Serialize construction. A `ReentrantMutex` lets a handler callback
+        // re-enter `open` on the same thread; after construction we re-check
+        // the cache and close the losing store.
+        let _opening = global.opening.lock();
+        {
+            let mut map = global.instances.lock();
+            if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+                if existing.is_closed() {
+                    map.remove(&key);
+                } else {
+                    return Ok(existing);
+                }
             }
         }
+
+        let store = Store::open_at(platform, root, id, config)?;
+        {
+            let mut map = global.instances.lock();
+            if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+                if !existing.is_closed() {
+                    store.close();
+                    return Ok(existing);
+                }
+                map.remove(&key);
+            }
+            map.insert(key, Arc::downgrade(&store));
+        }
+        return Ok(store);
     }
 
-    let store = Store::open_at(platform, root, id, config)?;
-    if let Some(global) = GLOBAL.get() {
-        global.instances.lock().insert(key, Arc::downgrade(&store));
-    }
-    Ok(store)
+    Store::open_at(platform, root, id, config)
 }
 
 /// Remove an instance from the cache (called by `Mmkv::close`).
@@ -243,10 +263,12 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::NoopHandler;
 
+    #[cfg(unix)]
     #[test]
     fn init_returns_the_root_once() {
+        use crate::handler::NoopHandler;
+
         let dir = tempfile::tempdir().unwrap();
         let platform = Arc::new(mmkv_platform_posix::PosixPlatform::new(Some(
             dir.path().to_path_buf(),

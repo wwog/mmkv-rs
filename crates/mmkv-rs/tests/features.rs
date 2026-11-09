@@ -228,6 +228,60 @@ fn expiration_enable_and_disable_migrates_values() {
 }
 
 #[test]
+fn read_only_open_with_expiration_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), "expire_readonly", Mode::SINGLE_PROCESS, None);
+    store.enable_expiration(3_600).unwrap();
+    store.put_str("key", "value").unwrap();
+    store.sync();
+    drop(store);
+
+    let platform = mmkv_rs::default_platform();
+    let read_only = Store::open_at(
+        platform,
+        dir.path(),
+        "expire_readonly",
+        &StoreConfig::new()
+            .mode(Mode::READ_ONLY)
+            .expiration(mmkv_rs::Expiration::After(3_600)),
+    )
+    .expect("read-only open with expiration config");
+    assert_eq!(read_only.get_str("key").as_deref(), Some("value"));
+    assert!(read_only.is_expiration_enabled());
+}
+
+#[test]
+fn expiring_vector_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), "expire_vectors", Mode::SINGLE_PROCESS, None);
+    store.enable_expiration(0).unwrap();
+    store.put_i32_vec_expiring("ints", &[1, 2, 3], 1).unwrap();
+    store
+        .put_strings_expiring("strings", &["a".to_owned(), "b".to_owned()], 3_600)
+        .unwrap();
+    assert_eq!(store.get_i32_vec("ints"), Some(vec![1, 2, 3]));
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(store.get_i32_vec("ints"), None);
+    assert_eq!(
+        store.get_strings("strings"),
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+}
+
+#[test]
+fn close_releases_process_locks() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = open(dir.path(), "close_locks", Mode::MULTI_PROCESS, None);
+    let second = open(dir.path(), "close_locks", Mode::MULTI_PROCESS, None);
+    let guard = first.lock().unwrap();
+    assert!(second.try_lock().is_none());
+    drop(guard);
+    assert!(second.try_lock().is_some());
+    first.close();
+    assert!(second.try_lock().is_some());
+}
+
+#[test]
 fn expired_key_is_deleted_on_read() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path(), "expire_read", Mode::SINGLE_PROCESS, None);

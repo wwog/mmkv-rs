@@ -114,7 +114,7 @@ store.put_str("token", "secret")?;
 cargo test --workspace
 ```
 
-65 tests:
+68 tests:
 
 | Suite | Coverage |
 |---|---|
@@ -143,6 +143,7 @@ C++ core before the temporary test bridge was removed; see
 - [Platform guide](docs/PLATFORMS.md) — per-OS setup, JNI/ashmem, roots.
 - [Migration plan](docs/PORTING_PLAN.md) — format/architecture analysis and phased roadmap.
 - [Implementation status](docs/STATUS.md) — what is done and verified per platform.
+- [Code review](docs/REVIEW.md) — method/logic consistency and Rust-adaptation findings.
 - [Gap list](docs/GAPS.md) — remaining differences, exclusions and runtime-validation needs.
 
 ## Compatibility notes

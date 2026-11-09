@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mmkv_platform::{FileLockKind, LockMode, LockOutcome, Platform};
 use parking_lot::Mutex;
@@ -23,7 +24,7 @@ pub struct FileLock {
     platform: Option<Arc<dyn Platform>>,
     file: Option<File>,
     kind: FileLockKind,
-    enabled: bool,
+    enabled: AtomicBool,
     counts: Mutex<Counts>,
 }
 
@@ -33,7 +34,7 @@ impl FileLock {
             platform: None,
             file: None,
             kind: FileLockKind::Advisory,
-            enabled: false,
+            enabled: AtomicBool::new(false),
             counts: Mutex::new(Counts::default()),
         }
     }
@@ -47,13 +48,28 @@ impl FileLock {
             platform: Some(platform),
             file: Some(file),
             kind,
-            enabled: true,
+            enabled: AtomicBool::new(true),
             counts: Mutex::new(Counts::default()),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Release every lock count and disable this lock. Used by `Store::close`
+    /// so closing an instance frees other processes even while Rust handles
+    /// still exist.
+    pub fn release_all(&self) {
+        if !self.enabled.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut counts = self.counts.lock();
+        if counts.shared > 0 || counts.exclusive > 0 {
+            let _ = self.funlock(LockMode::Exclusive);
+        }
+        counts.shared = 0;
+        counts.exclusive = 0;
     }
 
     fn flock(&self, mode: LockMode, wait: bool) -> io::Result<LockOutcome> {
@@ -81,10 +97,13 @@ impl FileLock {
     }
 
     pub fn lock(&self, mode: LockMode) -> io::Result<()> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return Ok(());
         }
         let mut counts = self.counts.lock();
+        if !self.is_enabled() {
+            return Ok(());
+        }
         match mode {
             LockMode::Shared => {
                 if counts.shared == 0 && counts.exclusive == 0 {
@@ -120,10 +139,13 @@ impl FileLock {
     }
 
     pub fn try_lock(&self, mode: LockMode) -> io::Result<bool> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return Ok(true);
         }
         let mut counts = self.counts.lock();
+        if !self.is_enabled() {
+            return Ok(true);
+        }
         match mode {
             LockMode::Shared => {
                 if counts.shared > 0 || counts.exclusive > 0 {
@@ -160,7 +182,7 @@ impl FileLock {
     }
 
     pub fn unlock(&self, mode: LockMode) {
-        if !self.enabled {
+        if !self.is_enabled() {
             return;
         }
         let mut counts = self.counts.lock();

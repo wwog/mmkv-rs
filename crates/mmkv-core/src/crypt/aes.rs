@@ -55,6 +55,14 @@ impl std::fmt::Debug for AesCrypt {
     }
 }
 
+impl Drop for AesCrypt {
+    fn drop(&mut self) {
+        self.key.fill(0);
+        self.ivec.fill(0);
+        self.initial_iv.fill(0);
+    }
+}
+
 impl AesCrypt {
     /// MMKV uses the raw key bytes, truncated or zero-padded to 16/32 bytes.
     pub fn new(key: &[u8], aes256: bool) -> Self {

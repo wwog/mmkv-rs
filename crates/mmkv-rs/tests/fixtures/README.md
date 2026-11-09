@@ -18,7 +18,7 @@ workspace):
 | `crypt256` | AES-256 key `0123456789abcdef0123456789abcdef`; 1 KB value |
 | `crypt_single` | one key updated 25 times (random-IV reuse regression) |
 | `crypt_bulk` | 300 × 300-byte encrypted values |
-| `expire` | key expiration enabled; `keep`/`num` valid for an hour, `gone` expired |
+| `expire` | key expiration enabled; `keep`/`num` timestamps normalized to a far-future value, `gone` expired |
 
 `crates/mmkv/tests/fixtures.rs` opens these files read-only and verifies every
 value. This keeps byte-level compatibility coverage without requiring a C++

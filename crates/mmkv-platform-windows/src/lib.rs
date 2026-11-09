@@ -76,21 +76,29 @@ mod windows_impl {
                     .open(path)?
             };
             let actual = file.metadata()?.len() as usize;
-            let mut target = initial_capacity(expected_size, page_size);
-            if actual > 0 {
-                if !actual.is_multiple_of(page_size) {
-                    target = round_up_to_page(actual, page_size);
-                } else if actual >= page_size {
-                    target = actual;
+            let mut target = if read_only {
+                // Read-only mappings use the real file size, never a
+                // page-rounded over-map.
+                actual
+            } else {
+                initial_capacity(expected_size, page_size)
+            };
+            if !read_only {
+                if actual > 0 {
+                    if !actual.is_multiple_of(page_size) {
+                        target = round_up_to_page(actual, page_size);
+                    } else if actual >= page_size {
+                        target = actual;
+                    }
                 }
-            }
-            if !read_only && actual != target {
-                if actual > target {
-                    target = actual;
-                }
-                file.set_len(target as u64)?;
-                if target > actual {
-                    zero_fill(&mut file, actual as u64, target - actual)?;
+                if actual != target {
+                    if actual > target {
+                        target = actual;
+                    }
+                    file.set_len(target as u64)?;
+                    if target > actual {
+                        zero_fill(&mut file, actual as u64, target - actual)?;
+                    }
                 }
             }
             let mut region = Self {
@@ -213,7 +221,6 @@ mod windows_impl {
             if target == old {
                 return Ok(());
             }
-            self.unmap();
             self.file.set_len(target as u64)?;
             if target > old {
                 if let Err(err) = zero_fill(&mut self.file, old as u64, target - old) {
@@ -221,6 +228,7 @@ mod windows_impl {
                     return Err(err);
                 }
             }
+            self.unmap();
             self.map(target)
         }
 
