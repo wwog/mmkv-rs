@@ -66,6 +66,11 @@ impl FileLock {
         }
         let mut counts = self.counts.lock();
         if counts.shared > 0 || counts.exclusive > 0 {
+            // Win32 keeps a shared lock layered under an exclusive one and
+            // needs an extra unlock; POSIX only needs the final LOCK_UN.
+            if counts.exclusive > 0 && counts.shared > 0 {
+                let _ = self.downgrade();
+            }
             let _ = self.funlock(LockMode::Exclusive);
         }
         counts.shared = 0;
@@ -94,6 +99,20 @@ impl FileLock {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
         platform.unlock_file_kind(file, mode, self.kind)
+    }
+
+    /// Turn the held exclusive lock into a shared lock (POSIX `LOCK_SH`
+    /// conversion; two-step lock/unlock on Win32).
+    fn downgrade(&self) -> io::Result<()> {
+        let platform = self
+            .platform
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file lock is disabled"))?;
+        platform.downgrade_lock(file, self.kind)
     }
 
     pub fn lock(&self, mode: LockMode) -> io::Result<()> {
@@ -169,7 +188,21 @@ impl FileLock {
                         counts.exclusive = 1;
                         return Ok(true);
                     }
-                    return Ok(false);
+                    // Win32 cannot take an exclusive lock on top of a shared
+                    // one ("always fail" in InterProcessLock_Win32.cpp), so
+                    // drop the shared lock and try again; restore it on
+                    // failure. Matches C++ `platformLock(unLockFirstIfNeeded)`.
+                    self.funlock(LockMode::Exclusive)?;
+                    return match self.flock(LockMode::Exclusive, false)? {
+                        LockOutcome::Acquired => {
+                            counts.exclusive = 1;
+                            Ok(true)
+                        }
+                        LockOutcome::WouldBlock => {
+                            let _ = self.flock(LockMode::Shared, true);
+                            Ok(false)
+                        }
+                    };
                 }
                 if self.flock(LockMode::Exclusive, false)? == LockOutcome::Acquired {
                     counts.exclusive = 1;
@@ -203,8 +236,9 @@ impl FileLock {
                 counts.exclusive -= 1;
                 if counts.exclusive == 0 {
                     if counts.shared > 0 {
-                        // Downgrade: flock(LOCK_SH) converts the lock.
-                        let _ = self.flock(LockMode::Shared, true);
+                        // Downgrade: POSIX converts with LOCK_SH, Win32 layers
+                        // a shared lock and unlocks the exclusive one.
+                        let _ = self.downgrade();
                     } else {
                         let _ = self.funlock(LockMode::Exclusive);
                     }

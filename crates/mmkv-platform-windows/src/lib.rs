@@ -13,10 +13,12 @@ mod windows_impl {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use mmkv_platform::{
-        AppState, LockMode, LockOutcome, MappedRegion, Platform, SyncMode, initial_capacity,
-        round_up_to_page,
+        AppState, FileLockKind, LockMode, LockOutcome, MappedRegion, Platform, SyncMode,
+        initial_capacity, round_up_to_page,
     };
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED, GetLastError, HANDLE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FlushFileBuffers, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
         UnlockFileEx,
@@ -91,14 +93,16 @@ mod windows_impl {
                         target = actual;
                     }
                 }
-                if actual != target {
-                    if actual > target {
-                        target = actual;
-                    }
-                    file.set_len(target as u64)?;
-                    if target > actual {
-                        zero_fill(&mut file, actual as u64, target - actual)?;
-                    }
+                if actual > target {
+                    // Defensive: never shrink an existing store on open.
+                    target = actual;
+                }
+                if target > actual {
+                    // Grow by writing past EOF. `SetEndOfFile` fails with
+                    // ERROR_USER_MAPPED_FILE while any view of the file exists
+                    // (including views in other processes sharing a
+                    // multi-process store), while plain writes do not.
+                    zero_fill(&mut file, actual as u64, target - actual)?;
                 }
             }
             let mut region = Self {
@@ -115,8 +119,10 @@ mod windows_impl {
         }
 
         fn map(&mut self, len: usize) -> io::Result<()> {
+            // A view should never be live here, but leaking one would keep the
+            // file pinned and make every later `SetEndOfFile` fail.
+            self.unmap();
             if len == 0 {
-                self.view = View::Empty;
                 return Ok(());
             }
             let protect = if self.read_only {
@@ -186,6 +192,15 @@ mod windows_impl {
         }
     }
 
+    impl Drop for WindowsMappedRegion {
+        fn drop(&mut self) {
+            // Without this the view stays mapped after the handle is closed;
+            // Windows then refuses to truncate/rewrite the file with
+            // ERROR_USER_MAPPED_FILE (and the address space leaks).
+            self.unmap();
+        }
+    }
+
     impl MappedRegion for WindowsMappedRegion {
         fn size(&self) -> usize {
             self.len()
@@ -221,18 +236,18 @@ mod windows_impl {
             if target == old {
                 return Ok(());
             }
-            // SetEndOfFile fails while a view of the file is still mapped
-            // (ERROR_USER_MAPPED_FILE); C++ MMKV unmaps first for the same
-            // reason. Restore the old view if resizing fails.
+            // SetEndOfFile fails with ERROR_USER_MAPPED_FILE while any view of
+            // the file exists (C++ MMKV has the same limitation). Our own view
+            // is dropped first; growth avoids SetEndOfFile altogether by
+            // writing past EOF, which also works when another process still
+            // has the shared file mapped.
             self.unmap();
-            if let Err(err) = self.file.set_len(target as u64) {
-                let _ = self.map(old);
-                return Err(err);
-            }
-            if target > old
-                && let Err(err) = zero_fill(&mut self.file, old as u64, target - old)
-            {
-                let _ = self.file.set_len(old as u64);
+            if target > old {
+                if let Err(err) = zero_fill(&mut self.file, old as u64, target - old) {
+                    let _ = self.map(old);
+                    return Err(err);
+                }
+            } else if let Err(err) = self.file.set_len(target as u64) {
                 let _ = self.map(old);
                 return Err(err);
             }
@@ -261,14 +276,19 @@ mod windows_impl {
             lock_handle(handle_of(&self.file), mode, wait)
         }
 
-        fn unlock(&self, mode: LockMode) -> io::Result<()> {
-            unlock_handle(handle_of(&self.file), mode)
+        fn unlock(&self, _mode: LockMode) -> io::Result<()> {
+            unlock_handle(handle_of(&self.file))
         }
 
         fn file(&self) -> Option<&File> {
             Some(&self.file)
         }
     }
+
+    /// Byte-range lock length. C++ MMKV locks exactly one byte at offset 0 on
+    /// Win32 (`InterProcessLock_Win32.cpp`); matching it keeps locks
+    /// interoperable with the reference implementation.
+    const LOCK_RANGE_LEN: u32 = 1;
 
     fn lock_handle(handle: HANDLE, mode: LockMode, wait: bool) -> io::Result<LockOutcome> {
         let mut flags = 0u32;
@@ -280,7 +300,7 @@ mod windows_impl {
         }
         let mut overlapped = OVERLAPPED::default();
         // SAFETY: valid handle and overlapped structure.
-        let ok = unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
+        let ok = unsafe { LockFileEx(handle, flags, 0, LOCK_RANGE_LEN, 0, &mut overlapped) };
         if ok != 0 {
             return Ok(LockOutcome::Acquired);
         }
@@ -292,14 +312,21 @@ mod windows_impl {
         }
     }
 
-    fn unlock_handle(handle: HANDLE, _mode: LockMode) -> io::Result<()> {
+    fn unlock_handle(handle: HANDLE) -> io::Result<()> {
         let mut overlapped = OVERLAPPED::default();
         // SAFETY: valid handle and overlapped structure.
-        let ok = unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped) };
+        let ok = unsafe { UnlockFileEx(handle, 0, LOCK_RANGE_LEN, 0, &mut overlapped) };
         if ok != 0 {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            let error = unsafe { GetLastError() };
+            // Unlocking a range we do not hold is not an error for us: the lock
+            // table already reflects the state we want.
+            if error == ERROR_NOT_LOCKED {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(error as i32))
+            }
         }
     }
 
@@ -385,8 +412,19 @@ mod windows_impl {
             lock_handle(handle_of(file), mode, wait)
         }
 
-        fn unlock_file(&self, file: &File, mode: LockMode) -> io::Result<()> {
-            unlock_handle(handle_of(file), mode)
+        fn unlock_file(&self, file: &File, _mode: LockMode) -> io::Result<()> {
+            unlock_handle(handle_of(file))
+        }
+
+        /// Win32 needs two unlocks after an exclusive lock was layered over a
+        /// shared one: add the shared lock, then release the exclusive lock.
+        /// `InterProcessLock_Win32.cpp::platformUnLock(true)` does the same.
+        fn downgrade_lock(&self, file: &File, _kind: FileLockKind) -> io::Result<()> {
+            let handle = handle_of(file);
+            let mut overlapped = OVERLAPPED::default();
+            // SAFETY: valid handle and overlapped structure.
+            unsafe { LockFileEx(handle, 0, 0, LOCK_RANGE_LEN, 0, &mut overlapped) };
+            unlock_handle(handle)
         }
 
         fn random_bytes(&self, out: &mut [u8]) -> io::Result<()> {

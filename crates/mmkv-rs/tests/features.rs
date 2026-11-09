@@ -730,7 +730,9 @@ fn last_confirmed_recovery_keeps_following_appends() {
     let store = open(dir.path(), "recover_last", Mode::SINGLE_PROCESS, None);
     assert_eq!(store.count(), 200);
     // The loader must repair the meta CRC to the recovered payload; this is
-    // what lets the following append chain from a valid digest.
+    // what lets the following append chain from a valid digest. Flush first so
+    // the on-disk assertion does not depend on mapped-write visibility.
+    store.sync();
     let repaired = MetaInfo::read(&std::fs::read(&crc_path).unwrap()).unwrap();
     assert_eq!(repaired.crc_digest, repaired.last_crc_digest);
     store.put_str("after", "survives").unwrap();

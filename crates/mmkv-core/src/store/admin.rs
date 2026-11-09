@@ -5,7 +5,7 @@
 //! C++ implementation around backup/restore/removal.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
 
 use mmkv_platform::{LockMode, Platform};
@@ -142,8 +142,10 @@ fn copy_pair_locked(
     }
 
     // Backup locks the source `.crc` shared; restore locks the destination
-    // `.crc` exclusive, matching MMKV.
-    let lock_file = if restore {
+    // `.crc` exclusive, matching MMKV. The lock handle stays open for the
+    // restore copy: Win32 byte-range locks are mandatory, so the locked file
+    // cannot be re-opened for writing (C++ writes through the locked fd too).
+    let mut lock_file = if restore {
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -164,9 +166,42 @@ fn copy_pair_locked(
     }
 
     platform.copy_file(source, destination, restore)?;
-    platform.copy_file(&source_crc, &destination_crc, restore)?;
+    // Win32 byte-range locks are mandatory: accessing the locked `.crc`
+    // through a freshly opened handle fails. Copy through the handle that
+    // holds the lock, exactly like C++ (`copyFileContent(srcCRCPath, fd)`).
+    match (restore, lock_file.as_mut()) {
+        (true, Some(destination_file)) => copy_into_file(destination_file, &source_crc)?,
+        (false, Some(source_file)) => copy_out_of_file(source_file, &destination_crc)?,
+        (_, None) => platform.copy_file(&source_crc, &destination_crc, restore)?,
+    }
     drop(lock_file);
     Ok(())
+}
+
+/// Overwrite an open file with `source`.
+fn copy_into_file(destination: &mut File, source: &Path) -> io::Result<()> {
+    let mut source = File::open(source)?;
+    let source_len = source.metadata()?.len();
+    destination.seek(SeekFrom::Start(0))?;
+    io::copy(&mut source, destination)?;
+    // Truncate only when the destination was longer; this keeps the restore
+    // path working if the file is still mapped by an instance.
+    if destination.metadata()?.len() != source_len {
+        destination.set_len(source_len)?;
+    }
+    destination.sync_all()
+}
+
+/// Copy an open (and locked) source file to `destination`.
+fn copy_out_of_file(source: &mut File, destination: &Path) -> io::Result<()> {
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(destination)?;
+    source.seek(SeekFrom::Start(0))?;
+    io::copy(source, &mut destination)?;
+    destination.sync_all()
 }
 
 fn copy_tree(

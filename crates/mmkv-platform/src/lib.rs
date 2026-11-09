@@ -150,6 +150,17 @@ pub trait Platform: Send + Sync {
         self.unlock_file(file, mode)
     }
 
+    /// Convert an exclusive lock into a shared one without releasing it.
+    ///
+    /// POSIX `flock(LOCK_SH)` (or `F_RDLCK` for record locks) converts the
+    /// existing lock in place. Windows is different: a shared lock is layered
+    /// on top of the exclusive one and a second `UnlockFileEx` is required, so
+    /// that platform overrides this.
+    fn downgrade_lock(&self, file: &File, kind: FileLockKind) -> io::Result<()> {
+        self.lock_file_kind(file, LockMode::Shared, true, kind)
+            .map(|_| ())
+    }
+
     /// Android: reject mixing SINGLE_PROCESS and MULTI_PROCESS instances.
     /// The returned guard must be kept alive for the store's lifetime.
     fn check_process_mode(
