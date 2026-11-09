@@ -66,6 +66,37 @@ struct Inner {
     multi_process: bool,
 }
 
+/// In-memory expiration state, captured so a failed migration can be rolled
+/// back. The store must not keep advertising a layout the file didn't adopt.
+#[derive(Clone, Copy)]
+struct ExpirationState {
+    enabled: bool,
+    compare_before_set: bool,
+    expired_in_seconds: u32,
+    flags: u64,
+    version: u32,
+}
+
+impl ExpirationState {
+    fn capture(inner: &Inner) -> Self {
+        Self {
+            enabled: inner.expiration_enabled,
+            compare_before_set: inner.compare_before_set,
+            expired_in_seconds: inner.expired_in_seconds,
+            flags: inner.meta_info.flags,
+            version: inner.meta_info.version,
+        }
+    }
+
+    fn restore(self, inner: &mut Inner) {
+        inner.expiration_enabled = self.enabled;
+        inner.compare_before_set = self.compare_before_set;
+        inner.expired_in_seconds = self.expired_in_seconds;
+        inner.meta_info.flags = self.flags;
+        inner.meta_info.version = self.version;
+    }
+}
+
 pub struct Store {
     id: String,
     root: PathBuf,
@@ -411,11 +442,25 @@ impl Store {
         let new_crypter = key
             .filter(|key| !key.is_empty())
             .map(|key| AesCrypt::new(key.as_bytes(), aes256));
-        inner.crypter = new_crypter;
+        // Keep the old crypter until the rewrite succeeds. A failed rekey must
+        // not leave the store decrypting the untouched old file with the new
+        // key. Capacity/random-bytes failures happen before the payload is
+        // written; a mid-write IO failure is unrecoverable and still surfaces
+        // as Err.
+        let previous_crypter = std::mem::replace(&mut inner.crypter, new_crypter);
+        let previous_compare_before_set = inner.compare_before_set;
         if inner.crypter.is_some() {
             inner.compare_before_set = false;
         }
-        self.write_all_entries_locked(&mut inner, entries, true)
+
+        match self.write_all_entries_locked(&mut inner, entries, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                inner.crypter = previous_crypter;
+                inner.compare_before_set = previous_compare_before_set;
+                Err(err)
+            }
+        }
     }
 
     /// Update the in-memory crypt key without rewriting the file. This mirrors
@@ -2537,6 +2582,7 @@ impl Store {
     }
 
     fn enable_expiration_locked(&self, inner: &mut Inner, seconds: u32) -> Result<()> {
+        let previous = ExpirationState::capture(inner);
         inner.expired_in_seconds = seconds;
         if inner.expiration_enabled {
             inner.compare_before_set = false;
@@ -2563,21 +2609,31 @@ impl Store {
         inner.meta_info.set_flag(meta::FLAG_ENABLE_KEY_EXPIRE);
         inner.meta_info.version = meta::VERSION_FLAG;
 
-        if empty {
-            self.write_actual_size_locked(inner, 0, 0, true, None)?;
-            inner.meta.sync(SyncMode::Sync)?;
-            return Ok(());
-        }
+        let result = (|| -> Result<()> {
+            if empty {
+                self.write_actual_size_locked(inner, 0, 0, true, None)?;
+                inner.meta.sync(SyncMode::Sync)?;
+                return Ok(());
+            }
 
-        let entries = self
-            .all_values_raw_locked(inner)?
-            .into_iter()
-            .map(|(key, mut value)| {
-                value.extend_from_slice(&time.to_le_bytes());
-                (key, value)
-            })
-            .collect();
-        self.write_all_entries_locked(inner, entries, true)
+            let entries = self
+                .all_values_raw_locked(inner)?
+                .into_iter()
+                .map(|(key, mut value)| {
+                    value.extend_from_slice(&time.to_le_bytes());
+                    (key, value)
+                })
+                .collect();
+            self.write_all_entries_locked(inner, entries, true)
+        })();
+
+        if result.is_err() {
+            // Capacity/random-bytes failures happen before the payload is
+            // touched. A mid-write IO failure is unrecoverable and still
+            // surfaces as Err.
+            previous.restore(inner);
+        }
+        result
     }
 
     fn disable_expiration_locked(&self, inner: &mut Inner) -> Result<()> {
@@ -2597,11 +2653,18 @@ impl Store {
                 (key, value)
             })
             .collect();
+        let previous = ExpirationState::capture(inner);
         inner.expiration_enabled = false;
         inner.expired_in_seconds = 0;
         inner.meta_info.unset_flag(meta::FLAG_ENABLE_KEY_EXPIRE);
         inner.meta_info.version = meta::VERSION_FLAG;
-        self.write_all_entries_locked(inner, entries, true)
+
+        let result = self.write_all_entries_locked(inner, entries, true);
+        if result.is_err() {
+            // See enable_expiration_locked: only pre-write failures roll back.
+            previous.restore(inner);
+        }
+        result
     }
 
     fn all_values_raw_locked(&self, inner: &mut Inner) -> Result<RawEntries> {

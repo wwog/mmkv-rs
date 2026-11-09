@@ -2,9 +2,42 @@
 
 > 范围：`mmkv-core`、`mmkv-rs` 门面、六个平台 crate
 > 基线：C++ MMKV v2.4.3
-> 结果：第一轮修复 17 个逻辑/一致性问题；第二轮（let it crash）修复 6 个缺陷。
-> 当前 **71 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净，
-> 四个交叉 target 编译通过。
+> 结果：第一轮修复 17 个逻辑/一致性问题；第二轮（let it crash）修复 6 个缺陷；
+> 终审修复 3 个失败路径状态不一致。当前 **71 个测试通过**，
+> `clippy --workspace --all-targets -D warnings` 干净，四个交叉 target 编译通过。
+
+## 终审（2026-11-09）
+
+覆盖范围：`mmkv-core`（store/加载/写回/加密/过期/多进程/lock/registry/meta/
+codec/admin/namespace）、`mmkv-rs` 门面、六个平台 crate、测试与 CI。
+逐项对照 C++ v2.4.3 的关键路径：`loadFromFile`/`checkDataValid`、
+`writeActualSize`、`reKey`/`checkReSetCryptKey`、`enable/disableAutoKeyExpire`、
+`importFrom`、`clearAll`/`trim`、Android 进程模式与 legacy 迁移、Windows
+`truncate` 顺序、Apple 根目录/生命周期。
+
+### 终审修复：失败路径不能留下“内存认为已生效、文件没生效”的状态
+
+| # | 问题 | 影响 | 修复 |
+|---|---|---|---|
+| F1 | `rekey` 在重写前就替换 `inner.crypter` | 重写失败（容量/随机数错误）后，后续读写会拿新 key 解旧文件，等于整库不可读 | 保留旧 crypter，写成功后才提交；失败回滚 |
+| F2 | `enable_expiration` 迁移失败后内存标志已打开 | 后续 `put` 写入带时间戳，但 meta 没有 expiration flag；重载后向量类值会把时间戳当成元素解析 | 失败时回滚 expiration/compare/flags/version |
+| F3 | `disable_expiration` 迁移失败后内存标志已关闭 | 后续 `put` 不带时间戳，但文件 meta 仍标记 expiration；重载后新值会被裁掉尾部 4 字节 | 同样回滚 |
+
+这三处都只在“写 payload 之前”失败时回滚（容量检查、随机数、编码检查）；
+若真的写了一半再失败，文件已经不一致，按 let it crash 直接返回 `Err`，
+不做半吊子恢复。
+
+### 终审判定
+
+- 核心格式、CRC/meta、加密、过期、多进程刷新、备份恢复与 C++ 语义一致；
+  C++ 生成的明文/加密/过期 fixtures 全部可读。
+- 调用方误用（handler 重入、错误 key/模式）按 let it crash 处理：返回错误或
+  panic，不再用防御性逻辑掩盖。
+- 剩余风险集中在**环境**而非逻辑：非 macOS 平台未真机运行、Android ashmem
+  跨进程 FD 交接未实现、非 UTF-8 key/value、Apple SIGBUS 级磁盘错误检测。
+  这些都已记录在 [GAPS.md](GAPS.md)，不阻塞当前 Rust 应用场景。
+- 未为失败路径回滚新增测试：需要注入 IO/随机数故障才能稳定复现；代码路径
+  已通过快照+恢复保持简单可审计。
 
 ## 0. 第二轮 Review（2026-11-09）：让错误暴露，而不是层层兜底
 

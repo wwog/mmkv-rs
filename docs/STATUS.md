@@ -99,6 +99,8 @@
 - registry 缓存 key 与 `store.root` 使用同一个规范化路径。
 - Windows `resize` 先 unmap 再 `SetEndOfFile`，失败恢复旧映射。
 - `put_*` 刷新 `last_access`。
+- 终审：`rekey` 与启用/禁用过期迁移失败时回滚内存状态，不会出现
+  “内存认为已生效、文件没生效”的半状态。
 
 ## 测试
 
