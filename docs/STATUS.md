@@ -2,8 +2,10 @@
 
 > 最后更新：2026-11-09
 > 版本：`mmkv-rs` 0.1.0
-> 验证：**68 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
-> 说明：本项目面向 Rust 应用，不包含语言绑定；CI 按用户要求未添加。
+> 验证：**71 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
+> 说明：本项目面向 Rust 应用，不包含语言绑定。CI 见
+> `.github/workflows/ci.yml`：Linux/macOS/Windows 跑 `fmt`/`clippy`/`test`，
+> iOS/Android 做交叉编译检查。
 
 ## 平台矩阵
 
@@ -88,17 +90,27 @@
 - Windows：`CreateFileMappingW`/`MapViewOfFile`、`LockFileEx`、页大小、
   宽字符路径由 `Path` 处理；显式根目录。
 
+### 第二轮 review（let it crash）
+
+- last-confirmed 恢复后同步修复 meta CRC，后续追加不会因 CRC 种子错误丢失。
+- `reset_crypt_key` 清缓存后重载，外部 rekey 后内存字典不会停留在旧 key。
+- handler 重入改为明确 panic，不再自死锁；回调文档化为纯通知。
+- iOS 平台事件观察者保留到进程结束，内存警告/前后台跟踪生效。
+- registry 缓存 key 与 `store.root` 使用同一个规范化路径。
+- Windows `resize` 先 unmap 再 `SetEndOfFile`，失败恢复旧映射。
+- `put_*` 刷新 `last_access`。
+
 ## 测试
 
 | 套件 | 数量 | 内容 |
 |---|---|---|
-| `mmkv-core` 单元 | 26 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder |
+| `mmkv-core` 单元 | 27 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder、handler 重入 |
 | `fixtures.rs` | 9 | C++ v2.4.3 生成的明文/加密/过期文件 |
-| `features.rs` | 19 | 加密往返、C++ 加密追加、rekey、过期迁移/读取即删、备份恢复、多进程刷新、错误 key |
+| `features.rs` | 21 | 加密往返、C++ 加密追加、rekey/reset、过期迁移/读取即删、备份恢复、多进程刷新、last-confirmed 恢复 |
 | `multi_process.rs` | 1 | 两个独立进程并发写 |
 | `roundtrip.rs` | 7 | 明文增长/trim/compare/value size |
 | `apple_platform.rs` | 6 | objc2 路径、页大小、建目录、App Group |
-| 合计 | **68** | |
+| 合计 | **71** | |
 
 跨 target 编译检查：
 
@@ -116,5 +128,5 @@ cargo check -p mmkv-rs --target x86_64-pc-windows-msvc
 - 非 macOS 平台只做了编译验证，未在真机/模拟器运行。
 - Android ashmem 跨进程 FD 传递（ContentProvider/JNI）未实现。
 - Apple mmap 磁盘错误处理为“pread 探测 + 隔离”的近似实现。
-- 无语言绑定、无 CI（按用户要求）。
+- 无语言绑定（按用户要求）。CI 只覆盖编译，不含 iOS 模拟器/Android 模拟器运行测试。
 - NSObject/NSCoding 等 ObjC 对象 API 不在 Rust API 范围内。

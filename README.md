@@ -13,7 +13,8 @@ with one crate per supported OS. Foundation access uses **`objc2`** — no Swift
 shim, no Objective-C++ build step, no `cc` dependency.
 
 This crate targets **Rust applications**. Language bindings (C ABI, Swift,
-Kotlin, Flutter, Python) and CI are intentionally out of scope.
+Kotlin, Flutter, Python) are intentionally out of scope. CI runs the full test
+suite on Linux, macOS and Windows, and compile-checks the iOS/Android targets.
 
 ## Crates
 

@@ -1,0 +1,7 @@
+# Keep text files LF on every checkout so rustfmt/clippy/tests behave the same
+# on Windows runners.
+* text=auto eol=lf
+
+# The C++-generated MMKV fixtures are binary; never let Git convert line
+# endings (that would break the CRC checks).
+crates/mmkv-rs/tests/fixtures/** binary

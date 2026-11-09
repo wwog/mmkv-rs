@@ -617,8 +617,68 @@ fn reset_crypt_key_after_external_rekey() {
     writer.rekey(Some(&key2), false).unwrap();
     writer.sync();
     reader.reset_crypt_key(Some(&key2), false).unwrap();
-    reader.clear_memory_cache(false);
+    // No explicit cache flush: reset_crypt_key must reload by itself.
     assert_eq!(reader.get_str("key").as_deref(), Some("value"));
+}
+
+#[test]
+fn reset_crypt_key_handles_plain_and_cipher_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+
+    let reader = open(
+        dir.path(),
+        "external_rekey_dirs",
+        Mode::SINGLE_PROCESS,
+        None,
+    );
+    reader.put_str("key", "value").unwrap();
+    reader.put_str("large", &"L".repeat(1_000)).unwrap();
+    reader.sync();
+
+    // Another process turns the plain store into an encrypted one.
+    let writer = open(
+        dir.path(),
+        "external_rekey_dirs",
+        Mode::SINGLE_PROCESS,
+        None,
+    );
+    writer.rekey(Some(&key), false).unwrap();
+    writer.sync();
+    drop(writer);
+
+    reader.reset_crypt_key(Some(&key), false).unwrap();
+    assert!(reader.is_encryption_enabled());
+    assert_eq!(reader.get_str("key").as_deref(), Some("value"));
+    assert_eq!(reader.get_str("large"), Some("L".repeat(1_000)));
+
+    // And back to plaintext.
+    let writer = open(
+        dir.path(),
+        "external_rekey_dirs",
+        Mode::SINGLE_PROCESS,
+        Some((&key, false)),
+    );
+    writer.rekey(None, false).unwrap();
+    writer.sync();
+    drop(writer);
+
+    reader.reset_crypt_key(None, false).unwrap();
+    assert!(!reader.is_encryption_enabled());
+    assert_eq!(reader.get_str("key").as_deref(), Some("value"));
+
+    // Writes after the reload must produce a valid store.
+    reader.put_str("after", "reset").unwrap();
+    reader.sync();
+    drop(reader);
+    let reopened = open(
+        dir.path(),
+        "external_rekey_dirs",
+        Mode::SINGLE_PROCESS,
+        None,
+    );
+    assert_eq!(reopened.get_str("after").as_deref(), Some("reset"));
+    assert_eq!(reopened.get_str("large"), Some("L".repeat(1_000)));
 }
 
 #[test]
@@ -637,4 +697,47 @@ fn wrong_crypt_key_read_only_does_not_destroy_data() {
     let key = CryptKey::new(b"0123456789abcdef".to_vec());
     let store = open(dir.path(), "crypt128", Mode::READ_ONLY, Some((&key, false)));
     assert_eq!(store.get_str("small").as_deref(), Some("crypt-small"));
+}
+
+#[test]
+fn last_confirmed_recovery_keeps_following_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), "recover_last", Mode::SINGLE_PROCESS, None);
+    for index in 0..200 {
+        store
+            .put_str(&format!("k{index:03}"), &"V".repeat(300))
+            .unwrap();
+    }
+    // A full write-back records lastActualSize/lastCRC. `trim` forces one.
+    store.trim();
+    store.sync();
+    drop(store);
+
+    let crc_path = dir.path().join("recover_last.crc");
+    let mut bytes = std::fs::read(&crc_path).unwrap();
+    let mut meta = MetaInfo::read(&bytes).unwrap();
+    assert!(meta.last_actual_size > 0);
+    assert_eq!(
+        meta.last_actual_size, meta.actual_size,
+        "trim must leave a confirmed snapshot"
+    );
+    // Simulate the torn write that `checkDataValid` recovers from: the meta
+    // CRC no longer matches, but the last confirmed CRC still does.
+    meta.crc_digest ^= 0xFFFF_FFFF;
+    meta.write(&mut bytes);
+    std::fs::write(&crc_path, &bytes).unwrap();
+
+    let store = open(dir.path(), "recover_last", Mode::SINGLE_PROCESS, None);
+    assert_eq!(store.count(), 200);
+    // The loader must repair the meta CRC to the recovered payload; this is
+    // what lets the following append chain from a valid digest.
+    let repaired = MetaInfo::read(&std::fs::read(&crc_path).unwrap()).unwrap();
+    assert_eq!(repaired.crc_digest, repaired.last_crc_digest);
+    store.put_str("after", "survives").unwrap();
+    store.sync();
+    drop(store);
+
+    let reopened = open(dir.path(), "recover_last", Mode::SINGLE_PROCESS, None);
+    assert_eq!(reopened.get_str("after").as_deref(), Some("survives"));
+    assert_eq!(reopened.count(), 201);
 }

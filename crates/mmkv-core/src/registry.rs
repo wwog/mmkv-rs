@@ -57,7 +57,7 @@ pub fn init(
 
     // Memory warnings drop cached key/value dictionaries without unmapping the
     // metadata file (MMKV does the same on iOS).
-    let _cancel = platform.subscribe_app_events(Box::new(|event| {
+    let cancel = platform.subscribe_app_events(Box::new(|event| {
         if event != AppEvent::MemoryWarning {
             return;
         }
@@ -72,6 +72,10 @@ pub fn init(
             store.clear_memory_cache(false);
         }
     }));
+    // The subscription lives for the process lifetime. Dropping the returned
+    // cancellation callback here would remove the iOS observers immediately
+    // (MMKV never unsubscribes either).
+    std::mem::forget(cancel);
 
     let global = Global {
         platform,
@@ -129,7 +133,12 @@ fn open_registered(
     id: &str,
     config: &StoreConfig<'_>,
 ) -> Result<Mmkv> {
-    let key = registry_key(root, id);
+    // Canonicalize once and use the same path for the cache key and for the
+    // store. `Store::open_at` canonicalizes too; if the root was created after
+    // `init` computed it, the two paths could otherwise disagree and
+    // `forget`/`close_instance` would miss the entry.
+    let root = absolute_path(root);
+    let key = registry_key(&root, id);
     if let Some(global) = GLOBAL.get() {
         // Serialize construction. A `ReentrantMutex` lets a handler callback
         // re-enter `open` on the same thread; after construction we re-check
@@ -146,7 +155,7 @@ fn open_registered(
             }
         }
 
-        let store = Store::open_at(platform, root, id, config)?;
+        let store = Store::open_at(platform, &root, id, config)?;
         {
             let mut map = global.instances.lock();
             if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
@@ -161,7 +170,7 @@ fn open_registered(
         return Ok(store);
     }
 
-    Store::open_at(platform, root, id, config)
+    Store::open_at(platform, &root, id, config)
 }
 
 /// Remove an instance from the cache (called by `Mmkv::close`).
@@ -260,11 +269,10 @@ pub fn shutdown() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn init_returns_the_root_once() {
         use crate::handler::NoopHandler;

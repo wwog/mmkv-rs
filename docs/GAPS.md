@@ -1,7 +1,8 @@
 # 缺失内容 / 差异清单（v0.1.0 之后）
 
 > 基线：C++ MMKV **v2.4.3**
-> 本轮已完成 P0/P1 及大部分 P2 核心项；语言绑定与 CI 按用户要求不做。
+> 本轮已完成 P0/P1 及大部分 P2 核心项；语言绑定按用户要求不做，CI 已添加
+> （三个桌面平台跑测试，iOS/Android 做编译检查）。
 > 下文只列仍然存在的差异。已完成项见 [STATUS.md](STATUS.md)。
 
 ## 1. 运行时验证（P1，工程性）
@@ -39,7 +40,6 @@
 - `mmkv-ffi` C ABI（对齐 `Core/cbridge/MMKVBridge.h`）。
 - Swift Package、Kotlin/JNI、Flutter/Dart、Python、KMP。
 - 跨语言端到端测试。
-- CI（用户明确不需要）。
 
 ## 5. 恢复 / 容错精度（P2）
 
@@ -99,22 +99,22 @@
 
 ## 10. Rust 适配性剩余项
 
-详细分析见 [REVIEW.md](REVIEW.md) §2。
+详细分析见 [REVIEW.md](REVIEW.md) §0 与 §2。第二轮按 let it crash 原则处理：
+调用方写错代码时直接失败，不为错误用法兜底。
 
 | # | 项 | 说明 |
 |---|---|---|
-| 10.1 | Handler 重入 | `log`/CRC/`on_content_loaded`/`on_content_changed` 可能在持有 store 内部 `Mutex` 时执行；handler 同线程回调同一 store 会死锁。需要锁外通知或文档约束。 |
-| 10.2 | Getter 隐藏错误 | `get_*`/`count`/`all_keys` 将 Closed/IO/解码错误折叠为 None/0/空；建议增加 `try_*`。 |
-| 10.3 | void mutator | `clear`/`trim`/`sync`/`sync_async`/`clear_memory_cache`/`check_content_changed` 吞掉错误；建议返回 `Result` 或增加 `try_*`。 |
-| 10.4 | 核心静态 API | `remove_storage`/backup/restore 需要 `&dyn Platform`，与 `is_file_valid`/`exists` 不一致；建议 `StoreAdmin` 或 `*_unlocked`。 |
-| 10.5 | `open_at` 与 `config.root` | `open_at` 忽略 `config.root`（Namespace 语义）；建议 debug assert/文档。 |
+| 10.1 | Handler 重入 | 已按 let it crash 处理：handler 回调期间调用任何 MMKV API 会 panic，并给出明确信息，不再静默死锁。回调仍是锁内通知（与 C++ 语义一致）。 |
+| 10.2 | Getter 隐藏错误 | 不修：`get_*`/`count`/`all_keys` 返回 `Option`/默认值，对齐 C++ 的 `hasValue=false`；写路径已经是 `Result`。 |
+| 10.3 | void mutator | 不修：`clear`/`trim`/`sync`/`sync_async` 保持 C++ 的 void 语义。 |
+| 10.4 | 核心静态 API | `remove_storage`/backup/restore 需要 `&dyn Platform`，与 `is_file_valid`/`exists` 不一致；门面已隐藏该差异，暂不引入 `StoreAdmin`。 |
+| 10.5 | `open_at` 与 `config.root` | `open_at` 的显式 root 优先；文档已写明，不加 debug assert（`Store::open` 内部也会走 `open_at`）。 |
 | 10.6 | `close(&self)` | 不消费句柄；其他 Arc 克隆返回 Closed，与 C++ delete 语义不同。 |
 | 10.7 | 零拷贝/非 UTF-8 | `with_bytes`/`with_str` 仍复制；公开 key 仅 `&str`。 |
 
 ## 11. 明确不做（按用户范围）
 
 - 所有语言包装（C ABI、Swift、Kotlin、Flutter、Python、KMP）。
-- CI 配置。
 - Apple `NSCoding`/NSObject 对象 API。
 - 32 位目标。
 - Android ContentProvider / Parcelable / FD 跨进程交接（属于绑定层，见 §2）。

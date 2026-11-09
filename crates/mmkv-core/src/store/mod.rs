@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mmkv_platform::{FileLockKind, Platform, SyncMode, initial_capacity};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::codec::varint::{varint_size_i32, varint_size_u32};
 use crate::codec::{CodedInput, CodedOutput, mini_pb};
@@ -22,7 +22,7 @@ use crate::crypt::{AES_IV_LEN, AesCrypt, CryptReader, KeyValueHolderCrypt};
 use crate::error::{CorruptKind, Error, Recover, Result};
 use crate::kv::{KEY_SIZE_LIMIT, KeyValueHolder};
 use crate::lock::{FileLock, ProcessGuard};
-use crate::log::{handler, mmkv_log};
+use crate::log::{HandlerGuard, handler, in_handler, mmkv_log};
 use crate::memory::MemoryFile;
 use crate::meta::{self, MetaInfo};
 use crate::path::{
@@ -175,7 +175,7 @@ impl Store {
             });
             store.touch();
             {
-                let mut inner = store.inner.lock();
+                let mut inner = store.lock_inner();
                 if let Some(expiration) = config.expiration {
                     let _guard = store.lock.exclusive_guard()?;
                     store.load_locked(&mut inner)?;
@@ -289,7 +289,7 @@ impl Store {
         store.touch();
 
         {
-            let mut inner = store.inner.lock();
+            let mut inner = store.lock_inner();
             if let Some(expiration) = config.expiration {
                 let _guard = store.lock.exclusive_guard()?;
                 store.load_locked(&mut inner)?;
@@ -328,7 +328,22 @@ impl Store {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner.lock().closed
+        self.lock_inner().closed
+    }
+
+    /// Lock the store state.
+    ///
+    /// Handler callbacks run while this lock is held. The mutex is not
+    /// reentrant, so a handler that calls back into MMKV would deadlock;
+    /// fail loudly instead of hanging. Handlers are notifications only.
+    fn lock_inner(&self) -> MutexGuard<'_, Inner> {
+        if in_handler() {
+            panic!(
+                "MMKV handler callback re-entered store {:?}; handler callbacks must not call MMKV APIs",
+                self.id
+            );
+        }
+        self.inner.lock()
     }
 
     fn touch(&self) {
@@ -345,16 +360,16 @@ impl Store {
     }
 
     pub fn is_expiration_enabled(&self) -> bool {
-        self.inner.lock().expiration_enabled
+        self.lock_inner().expiration_enabled
     }
 
     pub fn is_compare_before_set_enabled(&self) -> bool {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         inner.compare_before_set && !inner.expiration_enabled && inner.crypter.is_none()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {
-        self.inner.lock().crypter.is_some()
+        self.lock_inner().crypter.is_some()
     }
 
     /// The configured crypt key bytes, if encryption is enabled.
@@ -370,7 +385,7 @@ impl Store {
     /// or change to a different key. MMKV rewrites the whole store and
     /// generates a fresh IV when encryption remains enabled.
     pub fn rekey(&self, key: Option<&CryptKey>, aes256: bool) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -405,23 +420,33 @@ impl Store {
 
     /// Update the in-memory crypt key without rewriting the file. This mirrors
     /// `checkReSetCryptKey`, used after another process called `rekey`.
+    ///
+    /// The in-memory dictionary is discarded and reloaded: after an external
+    /// key change it holds values decoded with the wrong (or no) key, and the
+    /// plaintext/ciphertext holder map is selected by `crypter.is_some()`.
     pub fn reset_crypt_key(&self, key: Option<&CryptKey>, aes256: bool) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
-        self.ensure_loaded_locked(&mut inner)?;
+
+        let unchanged = match (inner.crypter.as_ref(), key) {
+            (Some(crypter), Some(key)) => crypter.matches_key(key.as_bytes(), aes256),
+            (None, None) => true,
+            (None, Some(key)) => key.is_empty(),
+            (Some(_), None) => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+
+        // Matches C++ `checkReSetCryptKey`: clear the cache, swap the crypter,
+        // then reload. `load_locked` resets the IV from the meta file.
+        self.clear_memory_cache_locked(&mut inner, false);
         inner.crypter = key
             .filter(|key| !key.is_empty())
             .map(|key| AesCrypt::new(key.as_bytes(), aes256));
-        let iv = if inner.meta_info.version >= meta::VERSION_RANDOM_IV {
-            Some(inner.meta_info.vector)
-        } else {
-            None
-        };
-        if let Some(crypter) = inner.crypter.as_mut() {
-            crypter.reset_iv(iv.as_ref().map(|iv| iv.as_slice()));
-        }
+        self.ensure_loaded_locked(&mut inner)?;
         Ok(())
     }
 
@@ -431,7 +456,7 @@ impl Store {
         crate::registry::forget(self);
         self.lock.release_all();
         let _ = self.process_mode_guard.lock().take();
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.closed = true;
         inner.dict.clear();
         inner.dict_crypt.clear();
@@ -521,6 +546,7 @@ impl Store {
             0
         };
 
+        let mut actual_crc = meta_info.crc_digest;
         let (load, need_full_writeback) = {
             let bytes = inner.data.as_ref().expect("data exists").bytes();
             Self::validate(
@@ -528,6 +554,7 @@ impl Store {
                 file_size,
                 &meta_info,
                 &mut actual_size,
+                &mut actual_crc,
                 inner.recover,
                 &self.id,
             )
@@ -536,6 +563,24 @@ impl Store {
         inner.meta_info = meta_info;
         inner.crc_digest = inner.meta_info.crc_digest;
         inner.has_full_writeback = false;
+
+        // C++ `checkDataValid` repairs the meta after recovering to the
+        // last confirmed size (or to a legacy 4-byte header). Without this,
+        // the next append would chain from a CRC that does not describe the
+        // current payload, and the appended data would fail validation on the
+        // following load.
+        if load
+            && !need_full_writeback
+            && inner.meta_info.version >= meta::VERSION_ACTUAL_SIZE
+            && (inner.meta_info.actual_size as usize != actual_size
+                || inner.meta_info.crc_digest != actual_crc)
+        {
+            if inner.read_only {
+                inner.crc_digest = actual_crc;
+            } else {
+                self.write_actual_size_locked(inner, actual_size, actual_crc, false, None)?;
+            }
+        }
 
         if let Some(crypter) = inner.crypter.as_mut() {
             let iv = if inner.meta_info.version >= meta::VERSION_RANDOM_IV {
@@ -654,12 +699,15 @@ impl Store {
     }
 
     /// Mirrors `checkDataValid`: returns `(load, need_full_writeback)` and may
-    /// rewrite `actual_size` to the last confirmed or recovered value.
+    /// rewrite `actual_size`/`actual_crc` to the last confirmed or recovered
+    /// value. `actual_crc` is the digest that describes the final payload; it
+    /// may differ from `meta.crc_digest` after recovery.
     fn validate(
         data: &[u8],
         file_size: usize,
         meta: &MetaInfo,
         actual_size: &mut usize,
+        actual_crc: &mut u32,
         recover: Option<Recover>,
         id: &str,
     ) -> (bool, bool) {
@@ -683,26 +731,32 @@ impl Store {
             if old_style != *actual_size
                 && old_style < file_size
                 && old_style + FIXED32_SIZE <= file_size
-                && crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + old_style]) == meta.crc_digest
             {
-                mmkv_log!(
-                    crate::handler::Level::Info,
-                    "[{}] looks like a downgrade & upgrade, using old actual size {}",
-                    id,
-                    old_style
-                );
-                *actual_size = old_style;
-                return (true, false);
+                let crc = crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + old_style]);
+                if crc == meta.crc_digest {
+                    mmkv_log!(
+                        crate::handler::Level::Info,
+                        "[{}] looks like a downgrade & upgrade, using old actual size {}",
+                        id,
+                        old_style
+                    );
+                    *actual_size = old_style;
+                    *actual_crc = crc;
+                    return (true, false);
+                }
             }
         }
 
         if *actual_size < file_size && *actual_size + FIXED32_SIZE <= file_size {
-            if crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + *actual_size]) == meta.crc_digest {
+            let crc = crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + *actual_size]);
+            if crc == meta.crc_digest {
+                *actual_crc = crc;
                 return (true, false);
             }
 
-            if let Some(last) = last_confirmed(data, file_size, meta) {
+            if let Some((last, last_crc)) = last_confirmed(data, file_size, meta) {
                 *actual_size = last;
+                *actual_crc = last_crc;
                 return (true, false);
             }
 
@@ -726,8 +780,9 @@ impl Store {
             *actual_size,
             file_size
         );
-        if let Some(last) = last_confirmed(data, file_size, meta) {
+        if let Some((last, last_crc)) = last_confirmed(data, file_size, meta) {
             *actual_size = last;
+            *actual_crc = last_crc;
             return (true, false);
         }
 
@@ -857,13 +912,17 @@ impl Store {
     }
 
     fn notify_content_changed(&self) {
-        if let Some(handler) = handler() {
+        if let Some(handler) = handler()
+            && let Some(_guard) = HandlerGuard::enter()
+        {
             handler.on_content_changed(&self.id);
         }
     }
 
     fn notify_content_loaded(&self) {
-        if let Some(handler) = handler() {
+        if let Some(handler) = handler()
+            && let Some(_guard) = HandlerGuard::enter()
+        {
             handler.on_content_loaded(&self.id);
         }
     }
@@ -957,7 +1016,8 @@ impl Store {
         if key.is_empty() {
             return Err(Error::InvalidId(key.to_owned()));
         }
-        let mut inner = self.inner.lock();
+        self.touch();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -1773,7 +1833,7 @@ impl Store {
 
     fn with_shared<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> Result<R> {
         self.touch();
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -1784,7 +1844,7 @@ impl Store {
 
     fn with_exclusive<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
         self.touch();
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -2377,7 +2437,7 @@ impl Store {
     }
 
     fn trim_locked(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -2414,7 +2474,7 @@ impl Store {
     }
 
     pub fn clear_memory_cache(&self, keep_space: bool) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.clear_memory_cache_locked(&mut inner, keep_space);
     }
 
@@ -2427,7 +2487,7 @@ impl Store {
     }
 
     fn sync_impl(&self, mode: SyncMode) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.closed {
             return Err(Error::Closed);
         }
@@ -2441,7 +2501,7 @@ impl Store {
     }
 
     pub fn check_content_changed(&self) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         let _ = self.ensure_loaded_locked(&mut inner);
     }
 
@@ -2632,8 +2692,8 @@ impl Store {
             (source, self)
         };
 
-        let mut first_inner = first.inner.lock();
-        let mut second_inner = second.inner.lock();
+        let mut first_inner = first.lock_inner();
+        let mut second_inner = second.lock_inner();
         let _first_guard = if first.mode.is_read_only() {
             first.lock.shared_guard()?
         } else {
@@ -2727,34 +2787,43 @@ fn recover_unreadable(path: &Path) {
 }
 
 fn strategy_for_crc(config: Option<Recover>, id: &str) -> Recover {
-    config.unwrap_or_else(|| {
-        handler()
-            .map(|handler| handler.on_crc_check_fail(id))
-            .unwrap_or(Recover::Discard)
-    })
+    if let Some(config) = config {
+        return config;
+    }
+    let Some(handler) = handler() else {
+        return Recover::Discard;
+    };
+    let Some(_guard) = HandlerGuard::enter() else {
+        return Recover::Discard;
+    };
+    handler.on_crc_check_fail(id)
 }
 
 fn strategy_for_length(config: Option<Recover>, id: &str) -> Recover {
-    config.unwrap_or_else(|| {
-        handler()
-            .map(|handler| handler.on_file_length_error(id))
-            .unwrap_or(Recover::Discard)
-    })
+    if let Some(config) = config {
+        return config;
+    }
+    let Some(handler) = handler() else {
+        return Recover::Discard;
+    };
+    let Some(_guard) = HandlerGuard::enter() else {
+        return Recover::Discard;
+    };
+    handler.on_file_length_error(id)
 }
 
-fn last_confirmed(data: &[u8], file_size: usize, meta: &MetaInfo) -> Option<usize> {
+fn last_confirmed(data: &[u8], file_size: usize, meta: &MetaInfo) -> Option<(usize, u32)> {
     if meta.version < meta::VERSION_ACTUAL_SIZE {
         return None;
     }
     let last = meta.last_actual_size as usize;
-    if last < file_size
-        && last + FIXED32_SIZE <= file_size
-        && crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + last]) == meta.last_crc_digest
-    {
-        Some(last)
-    } else {
-        None
+    if last < file_size && last + FIXED32_SIZE <= file_size {
+        let crc = crc32(0, &data[FIXED32_SIZE..FIXED32_SIZE + last]);
+        if crc == meta.last_crc_digest {
+            return Some((last, crc));
+        }
     }
+    None
 }
 
 fn encoded_value_length(blob: &[u8], data_holder: bool) -> Result<u32> {
@@ -3009,5 +3078,21 @@ mod tests {
         let entries = decode_entries(&buffer, 0, false).unwrap();
         assert_eq!(entries.len(), 3);
         assert!(entries[2].1.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "handler callback re-entered")]
+    fn handler_reentry_panics_instead_of_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = Arc::new(mmkv_platform_posix::PosixPlatform::new(Some(
+            dir.path().to_path_buf(),
+        )));
+        let store = Store::open_at(platform, dir.path(), "handler_reentry", &StoreConfig::new())
+            .expect("open store");
+
+        // Simulate a handler callback calling back into the same store.
+        let _guard = HandlerGuard::enter().expect("enter handler callback");
+        let _ = store.is_closed();
     }
 }

@@ -2,8 +2,53 @@
 
 > 范围：`mmkv-core`、`mmkv-rs` 门面、六个平台 crate
 > 基线：C++ MMKV v2.4.3
-> 结果：review 期间修复了 17 个逻辑/一致性问题；当前 **68 个测试通过**，
-> `clippy --workspace --all-targets -D warnings` 干净，四个 target 编译通过。
+> 结果：第一轮修复 17 个逻辑/一致性问题；第二轮（let it crash）修复 6 个缺陷。
+> 当前 **71 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净，
+> 四个交叉 target 编译通过。
+
+## 0. 第二轮 Review（2026-11-09）：让错误暴露，而不是层层兜底
+
+> 原则：只有“数据/环境错误”（CRC、IO、损坏文件）需要恢复策略；
+> “调用方写错代码”（handler 重入、错误模式、错误配置）不在库内兜底，
+> 直接返回错误或 panic，对应 Erlang 的 let it crash。
+
+### 0.1 本轮修复
+
+| # | 问题 | 影响 | 修复 |
+|---|---|---|---|
+| 0.1 | last-confirmed 恢复后 CRC 种子未修复 | 恢复后继续追加，下次加载 CRC 失败，追加的数据丢失 | `validate` 同时返回恢复后的 CRC；`load_locked` 按 C++ `checkDataValid` 的顺序写回 meta |
+| 0.2 | `reset_crypt_key` 只换 crypter、不重载 | 外部 rekey 后内存里仍是旧 key 解出的字典，读写会看到空库 | 与 C++ `checkReSetCryptKey` 一致：清缓存 → 换 key → reload |
+| 0.3 | handler 回调内重入同一 store 自死锁 | 现场是 hang，没有信息 | handler 期间设置线程标记；重入时 panic 并给出明确信息 |
+| 0.4 | `init` 立即 drop 平台事件取消句柄 | iOS 的内存警告/前后台观察者被立即移除，生命周期跟踪失效 | 观察者保留到进程结束（与 C++ 相同） |
+| 0.5 | registry key 用未规范化 root，store 用规范化 root | 符号链接/后创建目录下 `forget`/`close_instance` 找不到实例 | `open_registered` 先规范化 root，key 与 `store.root` 一致 |
+| 0.6 | Windows `resize` 在映射存活时 `SetEndOfFile` | Windows 上 trim/clear 可能因 `ERROR_USER_MAPPED_FILE` 失败 | 先 unmap，再 set_len/zero-fill，失败时恢复旧映射（与 C++ 顺序一致） |
+
+另外：`put_*` 现在会刷新 `last_access`，自动清理不会把持续写入的实例当成空闲。
+
+新增回归测试：
+
+- `last_confirmed_recovery_keeps_following_appends`：篡改 meta CRC、保留
+  last-confirmed 快照，恢复后追加并重开，验证不丢数据。
+- `reset_crypt_key_handles_plain_and_cipher_directions`：明文 → 密文 → 明文，
+  `reset_crypt_key` 自身完成重载，不再依赖调用方 `clear_memory_cache`。
+- `handler_reentry_panics_instead_of_deadlocking`：回调重入直接 panic。
+
+### 0.2 明确定位为“不修”
+
+- **getter 吞错**（原 §2.2）：`get_*` 返回 `Option`/默认值，与 C++ 的
+  `hasValue=false` 对齐；真正的错误路径是写操作，已经是 `Result`。不新增
+  整套 `try_*`。
+- **void mutator**（原 §2.3）：`clear`/`trim`/`sync` 保持 C++ 的 void 语义，
+  不为每个 IO 错误增加返回通道。
+- **handler 时序重构**（原 §2.1）：不把通知挪到锁外。锁内通知是 C++ 的既有
+  语义，挪动会引入“通知时状态已变”的新竞态；改为 panic 更诚实。
+- **`open_at` 忽略 `config.root`**（原 §2.6）：保留“显式 root 优先”，在文档
+  中写明，不用 debug assert 惩罚 `Store::open` 的内部调用。
+
+### 0.3 仍然保留的已知差异
+
+见 [GAPS.md](GAPS.md)。本轮没有改变格式/字节层面的兼容性：C++ 生成的
+明文/加密 fixtures 仍可读，Rust 写出的文件仍可被 C++ 读取。
 
 ## 1. 已修复的问题
 

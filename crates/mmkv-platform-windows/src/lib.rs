@@ -221,14 +221,21 @@ mod windows_impl {
             if target == old {
                 return Ok(());
             }
-            self.file.set_len(target as u64)?;
-            if target > old {
-                if let Err(err) = zero_fill(&mut self.file, old as u64, target - old) {
-                    let _ = self.file.set_len(old as u64);
-                    return Err(err);
-                }
-            }
+            // SetEndOfFile fails while a view of the file is still mapped
+            // (ERROR_USER_MAPPED_FILE); C++ MMKV unmaps first for the same
+            // reason. Restore the old view if resizing fails.
             self.unmap();
+            if let Err(err) = self.file.set_len(target as u64) {
+                let _ = self.map(old);
+                return Err(err);
+            }
+            if target > old
+                && let Err(err) = zero_fill(&mut self.file, old as u64, target - old)
+            {
+                let _ = self.file.set_len(old as u64);
+                let _ = self.map(old);
+                return Err(err);
+            }
             self.map(target)
         }
 

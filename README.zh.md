@@ -10,8 +10,9 @@ key-expiration 存储）；在参考桥仍然存在时，Rust 写出的明文存
 Foundation 访问使用 **`objc2`** —— 不需要 Swift shim，不需要 Objective-C++ 构建步骤，
 也不依赖 `cc`。
 
-本 crate 面向 **Rust 应用**。语言绑定（C ABI、Swift、Kotlin、Flutter、Python）与 CI
-有意不在范围内。
+本 crate 面向 **Rust 应用**。语言绑定（C ABI、Swift、Kotlin、Flutter、Python）
+有意不在范围内。CI 在 Linux/macOS/Windows 上跑完整测试，并对 iOS/Android
+目标做编译检查。
 
 ## Crates
 

@@ -25,6 +25,11 @@ impl Level {
 
 /// Unified callback interface. Every method is optional; the defaults match
 /// MMKV's behaviour (`Discard` on CRC/length errors, no logging).
+///
+/// Callbacks are notifications only: they run while the store state lock is
+/// held, so they must not call back into MMKV (the same store or any other).
+/// Doing so panics with a clear message instead of deadlocking; the C++
+/// implementation hides this mistake behind a recursive mutex.
 pub trait Handler: Send + Sync {
     fn on_crc_check_fail(&self, _mmap_id: &str) -> Recover {
         Recover::Discard

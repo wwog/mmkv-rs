@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 mmkv-platform.workspace = true
+
+# Keep the workspace buildable on non-Apple hosts: objc2 itself rejects
+# non-Apple targets at compile time, so it must not be an unconditional
+# dependency of a workspace member.
+[target.'cfg(target_vendor = "apple")'.dependencies]
 mmkv-platform-posix.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true

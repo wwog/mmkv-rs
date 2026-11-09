@@ -7,7 +7,8 @@
 > **实施决策更新（2026-11-09，最终）**：门面 crate 命名为 **`mmkv-rs`**；平台目录获取使用
 > **objc2 / objc2-foundation**，不使用 Swift shim；iOS/Android/Linux/Windows 均已有独立平台 crate；
 > C++ 参考桥接已移除，兼容性由 C++ 生成的 **golden fixtures** 持续验证。
-> 按项目定位（Rust 应用），**不提供 C ABI/Swift/Kotlin/Flutter/Python 包装，也不添加 CI**。
+> 按项目定位（Rust 应用），**不提供 C ABI/Swift/Kotlin/Flutter/Python 包装**；
+> CI 已按后续要求添加：Linux/macOS/Windows 跑测试，iOS/Android 做交叉编译检查。
 > 下文保留原始方案作为设计记录，其中“Swift shim / C++ bridge / FFI”段落仅作历史参考。
 
 ---
@@ -254,7 +255,7 @@ mmkv-rs                  门面：init/init_with、Mmkv、Namespace，按 cfg �
 
 - `mmkv-core` 只依赖 `mmkv-platform` 的 trait，不直接调用 `std::fs` 之外的 OS API。
 - `mmkv` 用 `cfg(target_os)` 选择平台 crate，并 `pub type PlatformImpl = ...`；也允许用户直接依赖 `mmkv-core` + 自定义 `Platform`。
-- 语言绑定与 CI 不在本项目范围内（按用户决策）。
+- 语言绑定不在本项目范围内；CI 见 `.github/workflows/ci.yml`。
 
 ### 3.2 `mmkv-platform` 契约
 
@@ -733,7 +734,8 @@ pub fn shutdown();
 - `mmkv-ffi`：镜像 `Core/cbridge/MMKVBridge.h`，C ABI，`mmkv_free` 所有权规则。
 - Swift Package wrapper（可选直接暴露 C ABI）。
 - Android JNI wrapper（普通文件模式）。
-- CI：macOS aarch64/x86_64、Linux x86_64、iOS 模拟器；`fmt`/`clippy`/`test`/fixtures。
+- CI：已落地 `.github/workflows/ci.yml`（Linux/macOS/Windows `fmt`/`clippy`/`test`，
+  iOS/Android 交叉编译检查）；iOS 模拟器运行测试仍未做。
 - 文档：迁移指南、与 C++ API 对照、限制说明。
 
 验收：Swift/Kotlin demo 可读写同一个 store，并与 C++ MMKV 互操作。

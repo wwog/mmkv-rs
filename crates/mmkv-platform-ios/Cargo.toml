@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 mmkv-platform.workspace = true
+
+# See mmkv-platform-macos: objc2 only compiles on Apple targets, so the
+# workspace must stay buildable elsewhere.
+[target.'cfg(target_os = "ios")'.dependencies]
 mmkv-platform-posix.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
