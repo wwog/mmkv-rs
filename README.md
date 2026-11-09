@@ -13,7 +13,7 @@ shim, no Objective-C++ build step, no `cc` dependency.
 
 | Crate | Role |
 |---|---|
-| `mmkv` | Public façade: `init`, `open`, `default_store`, `Namespace`, static helpers |
+| `mmkv-rs` | Public façade: `init`, `open`, `default_store`, `Namespace`, static helpers |
 | `mmkv-core` | Engine: format, MiniPB codec, CRC-32, meta, plaintext + AES-CFB128 store, registry, backup |
 | `mmkv-platform` | Platform contract (`Platform`, `MappedRegion`, `AppLifecycle`) |
 | `mmkv-platform-posix` | Shared POSIX mmap + `flock` + `ftruncate` primitives |
@@ -38,11 +38,11 @@ shim, no Objective-C++ build step, no `cc` dependency.
 ## Quick start (macOS)
 
 ```rust
-fn main() -> mmkv::Result<()> {
+fn main() -> mmkv_rs::Result<()> {
     // Default root is NSDocumentDirectory/mmkv, like MMKV itself.
-    mmkv::init(mmkv::InitOptions::default())?;
+    mmkv_rs::init(mmkv_rs::InitOptions::default())?;
 
-    let store = mmkv::default_store(&mmkv::StoreConfig::new())?;
+    let store = mmkv_rs::default_store(&mmkv_rs::StoreConfig::new())?;
     store.put_str("user", "alice")?;
     store.put_i64("counter", 42)?;
     store.sync();
@@ -56,10 +56,10 @@ fn main() -> mmkv::Result<()> {
 Encrypted store:
 
 ```rust
-let key = mmkv::CryptKey::new(b"0123456789abcdef".to_vec());
-let store = mmkv::open(
+let key = mmkv_rs::CryptKey::new(b"0123456789abcdef".to_vec());
+let store = mmkv_rs::open(
     "com.example.secrets",
-    &mmkv::StoreConfig::new().crypt_key(&key, false), // false = AES-128
+    &mmkv_rs::StoreConfig::new().crypt_key(&key, false), // false = AES-128
 )?;
 store.put_str("token", "secret")?;
 ```
@@ -67,9 +67,9 @@ store.put_str("token", "secret")?;
 Explicit root:
 
 ```rust
-let store = mmkv::open(
+let store = mmkv_rs::open(
     "com.example.settings",
-    &mmkv::StoreConfig::new()
+    &mmkv_rs::StoreConfig::new()
         .root(std::path::Path::new("/tmp/mmkv"))
         .expected_capacity(64 * 1024),
 )?;

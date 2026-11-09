@@ -191,17 +191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mmkv"
-version = "0.1.0"
-dependencies = [
- "mmkv-core",
- "mmkv-platform",
- "mmkv-platform-macos",
- "mmkv-platform-posix",
- "tempfile",
-]
-
-[[package]]
 name = "mmkv-core"
 version = "0.1.0"
 dependencies = [
@@ -237,6 +226,17 @@ dependencies = [
  "libc",
  "memmap2",
  "mmkv-platform",
+]
+
+[[package]]
+name = "mmkv-rs"
+version = "0.1.0"
+dependencies = [
+ "mmkv-core",
+ "mmkv-platform",
+ "mmkv-platform-macos",
+ "mmkv-platform-posix",
+ "tempfile",
 ]
 
 [[package]]

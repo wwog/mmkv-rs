@@ -10,7 +10,7 @@
 |---|---|---|---|
 | 1.1 | **iOS 平台 crate** | 当前 facade 只对 `target_os = "macos"` 选择 macOS 实现；iOS 会落到 `mmkv-platform-posix`，默认目录不可用。需要独立 `mmkv-platform-ios` 并在 facade 中按 `target_os` 选择。 | P0 |
 | 1.2 | **iOS 文件保护** | `NSFileProtectionCompleteUntilFirstUserAuthentication` 只应在 iOS 可写文件上设置（数据 + `.crc`）；macOS 实现是 no-op。 | P0 |
-| 1.3 | **iOS 后台/内存警告** | `AppLifecycle` 契约存在，但没有任何平台实现订阅 `UIApplicationDidEnterBackgroundNotification` / `DidBecomeActive` / `DidReceiveMemoryWarning`。当前只有 `mmkv::init` 注册了一个空的内存警告回调。 | P1 |
+| 1.3 | **iOS 后台/内存警告** | `AppLifecycle` 契约存在，但没有任何平台实现订阅 `UIApplicationDidEnterBackgroundNotification` / `DidBecomeActive` / `DidReceiveMemoryWarning`。当前只有 `mmkv_rs::init` 注册了一个空的内存警告回调。 | P1 |
 | 1.4 | **自动空闲实例清理** | `enableAutoCleanUp(maxIdleMinutes)` / `disableAutoCleanUp` / `tryAutoCleanUpInstances` 未实现；iOS 后台状态对其的抑制逻辑也未实现。 | P2 |
 | 1.5 | **Linux 平台 crate** | `mmkv-platform-posix` 可工作，但无独立 crate、无 `renameat2`/`sendfile` 优化、无 CI；默认根目录按 MMKV 语义必须显式传入。 | P1 |
 | 1.6 | **Android 平台 crate** | 缺少 JNI/`Context` 获取 `filesDir/mmkv`、`cacheDir` 临时目录、`android_get_device_api_level`；目前只能显式传根目录。 | P0（Android 目标时） |

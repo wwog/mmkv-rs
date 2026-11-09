@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/mmkv",
+    "crates/mmkv-rs",
     "crates/mmkv-core",
     "crates/mmkv-platform",
     "crates/mmkv-platform-posix",
