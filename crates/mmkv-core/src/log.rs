@@ -77,9 +77,14 @@ pub fn log_at(level: Level, file: &str, line: u32, function: &str, message: &str
 }
 
 macro_rules! mmkv_log {
-    ($level:expr, $($arg:tt)*) => {
-        $crate::log::log_at($level, file!(), line!(), module_path!(), &format!($($arg)*))
-    };
+    ($level:expr, $($arg:tt)*) => {{
+        // Check the level before formatting: the old form built the message
+        // string on every call, even when the line was filtered out.
+        let level = $level;
+        if level != $crate::handler::Level::None && level >= $crate::log::level() {
+            $crate::log::log_at(level, file!(), line!(), module_path!(), &format!($($arg)*));
+        }
+    }};
 }
 
 pub(crate) use mmkv_log;

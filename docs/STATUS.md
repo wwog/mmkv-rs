@@ -1,8 +1,8 @@
 # 实施状态（基线：C++ MMKV v2.4.3）
 
-> 最后更新：2026-11-09
-> 版本：`mmkv-rs` 0.1.0
-> 验证：**71 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
+> 最后更新：2026-11-24
+> 版本：`mmkv-rs` 0.1.1
+> 验证：**80 个测试通过**，`clippy --workspace --all-targets -D warnings` 干净
 > 说明：本项目面向 Rust 应用，不包含语言绑定。CI 见
 > `.github/workflows/ci.yml`：Linux/macOS/Windows 跑 `fmt`/`clippy`/`test`，
 > iOS/Android 做交叉编译检查。
@@ -55,8 +55,9 @@
 - crypt holder：≤27 内联、≤256 缓存、>256 offset 惰性解密。
 - 加密追加、删除、全量写回、`rekey`（明文↔密文、换 key、128↔256）、
   `reset_crypt_key`。
-- **流式**：解码使用 16 字节窗口 + O(1) `status_at`，全量写回逐条写入/加密，
-  不再分配整段明文/密文缓冲。
+- **流式**：解码使用 16 字节窗口 + O(1) `status_at`；全量写回按 C++
+  `memmoveDictionary` 同构的做法原地完成（section `memmove` → 旧 status 解密 →
+  新 IV 逐条加密），峰值 = 一条记录。
 - NIST CFB 向量、C++ 加密 fixtures、在 C++ 加密文件上继续追加均通过。
 
 ### 过期
@@ -74,6 +75,36 @@
 - 写操作先取独占进程锁，再刷新 meta，避免“刷新后被其他进程追加”的丢写竞态。
 - sequence 变更全量重载；CRC/actualSize 变更增量加载；文件增长后重新 mmap。
 - **真实双进程压力测试**：两个独立 OS 进程各写 250 条，最终 500 条无丢失。
+
+### 性能（第三轮：对齐 C++，去掉多余分配/克隆）
+
+- 读取路径零拷贝：`get_*`/`with_bytes`/`with_str` 在锁内借用 mmap（`Cow`），
+  明文和加密缓存值不再先 `to_vec()` 再解码。
+- 加密 offset holder 读取不再克隆 AES key schedule：按偏移用 O(1)
+  `decrypt_at` 直接解密到 value 起始，省掉整个 cipher 克隆与前缀解密。
+- 更新已有 key 时原地替换 12 字节 holder，不再分配并复制 key；
+  `override_locked` 复用原 key 分配。
+- 全量写回不再克隆整库 key：明文路径只收集 `(offset, size)` 并 `memmove`；
+  加密路径就地流式重写（分配从 ~12.5K 降到 ~21，1.5K 条）。
+- `write_all_entries_locked`（rekey/过期迁移）直接写 mmap 并原地加密，
+  每条不再分配临时 `Vec`；加密小值 holder 复用已构造的缓冲（`from_owned`）。
+- 压缩路径的错误值改用 `ok_or_else`，避免每轮迭代构造 `Error::TooLarge` 的
+  `String`。
+- `mmkv_log!` 先判级别再 `format!`，过滤掉的日志不再分配。
+- 新增 `examples/bench.rs`：分配计数 + 计时基准。
+
+### 数据安全 / 过期（第三轮 review）
+
+- 过期检查不再完整解密：新增 `KeyValueHolder[::Crypt]::expiry`，只读（或只解密）
+  value 末尾 4 字节；此前加密 + 过期的一次读取会解密整值两遍。
+- `contains` 对齐 C++ `containsKey`：过期 key 返回 `false` 并立即删除。
+- `filterExpiredKeys` 改为 `retain` 原地删除，`count_non_expired` /
+  `all_keys_non_expired` 不再克隆整库 key。
+- `remove_many` 对齐 C++ `removeValuesForKeys`：批量删除后一次全量写回
+  （失败时丢弃内存缓存，回落到磁盘状态）。
+- 过期读删除路径在进程锁升级后重新 `ensure_loaded_locked` 并复查到期时间，
+  避免等待升级期间其他进程追加/改写后用陈旧 `actualSize` 追加 tombstone。
+- 过期 trailer 短于 4 字节时按“永不过期”处理并原样返回，与 C++ 一致。
 
 ### 平台细节
 
@@ -106,13 +137,13 @@
 
 | 套件 | 数量 | 内容 |
 |---|---|---|
-| `mmkv-core` 单元 | 27 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder、handler 重入 |
+| `mmkv-core` 单元 | 30 | varint/MiniPB、CRC、meta、NIST AES-CFB128、CFB 状态、流式解密、holder、handler 重入 |
 | `fixtures.rs` | 9 | C++ v2.4.3 生成的明文/加密/过期文件 |
-| `features.rs` | 21 | 加密往返、C++ 加密追加、rekey/reset、过期迁移/读取即删、备份恢复、多进程刷新、last-confirmed 恢复 |
+| `features.rs` | 27 | 加密往返、C++ 加密追加、rekey/reset、过期迁移/读取即删、备份恢复、多进程刷新、last-confirmed 恢复 |
 | `multi_process.rs` | 1 | 两个独立进程并发写 |
 | `roundtrip.rs` | 7 | 明文增长/trim/compare/value size |
 | `apple_platform.rs` | 6 | objc2 路径、页大小、建目录、App Group |
-| 合计 | **71** | |
+| 合计 | **80** | |
 
 跨 target 编译检查：
 

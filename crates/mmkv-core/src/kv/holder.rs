@@ -40,11 +40,35 @@ impl KeyValueHolder {
         let end = start.checked_add(self.value_size as usize)?;
         payload.get(start..end)
     }
+
+    /// Expiration trailer (`u32 LE`) of the value, read without copying.
+    ///
+    /// `None` when the value is too short to carry one; MMKV treats such
+    /// values as never expiring.
+    pub fn expiry(&self, payload: &[u8]) -> Option<u32> {
+        let value = self.value(payload)?;
+        let start = value.len().checked_sub(4)?;
+        Some(u32::from_le_bytes(value[start..].try_into().ok()?))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_reads_the_value_trailer() {
+        let holder = KeyValueHolder::new(3, 8, 0).unwrap();
+        let mut payload = vec![3u8];
+        payload.extend_from_slice(b"abc");
+        payload.push(8);
+        payload.extend_from_slice(b"valu");
+        payload.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        assert_eq!(holder.expiry(&payload), Some(0x1122_3344));
+
+        let short = KeyValueHolder::new(3, 2, 0).unwrap();
+        assert_eq!(short.expiry(b"\x03abc\x02hi"), None);
+    }
 
     #[test]
     fn computed_size_matches_layout() {

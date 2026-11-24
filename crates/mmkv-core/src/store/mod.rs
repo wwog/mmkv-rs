@@ -6,6 +6,7 @@
 
 mod admin;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use crate::codec::varint::{varint_size_i32, varint_size_u32};
 use crate::codec::{CodedInput, CodedOutput, mini_pb};
 use crate::config::{CryptKey, Expiration, Mode, StoreConfig};
 use crate::crc32::crc32;
-use crate::crypt::{AES_IV_LEN, AesCrypt, CryptReader, KeyValueHolderCrypt};
+use crate::crypt::{AES_IV_LEN, AesCrypt, AesStatus, CryptReader, KeyValueHolderCrypt};
 use crate::error::{CorruptKind, Error, Recover, Result};
 use crate::kv::{KEY_SIZE_LIMIT, KeyValueHolder};
 use crate::lock::{FileLock, ProcessGuard};
@@ -1132,7 +1133,7 @@ impl Store {
         if inner.crypter.is_some() {
             return self.set_crypt_blob_locked(inner, key, blob, data_holder);
         }
-        let (value_len, total) = encoded_entry(key, blob, data_holder)?;
+        let (_, total) = encoded_entry(key, blob, data_holder)?;
 
         if inner.item_size_limit != 0 && total > inner.item_size_limit as usize {
             return Err(Error::ItemSizeLimit {
@@ -1145,7 +1146,7 @@ impl Store {
             if inner.compare_before_set && !inner.expiration_enabled && inner.crypter.is_none() {
                 let equal = self
                     .value_for_inner(inner, existing)
-                    .map(|old| equal_encoded(&old, blob, data_holder))
+                    .map(|old| equal_encoded(old, blob, data_holder))
                     .unwrap_or(false);
                 if equal {
                     return Ok(());
@@ -1158,14 +1159,14 @@ impl Store {
                 inner.has_full_writeback = false;
                 return Ok(());
             }
-            self.append_locked(inner, key, blob, data_holder, value_len, total)?;
+            self.append_locked(inner, key, blob, data_holder, total, true)?;
         } else {
             let override_empty =
                 !inner.multi_process && inner.dict.is_empty() && inner.actual_size > 0;
             if override_empty && self.check_size_for_override(inner, total) {
                 self.override_locked(inner, key, blob, data_holder, total)?;
             } else {
-                self.append_locked(inner, key, blob, data_holder, value_len, total)?;
+                self.append_locked(inner, key, blob, data_holder, total, false)?;
             }
         }
         inner.has_full_writeback = false;
@@ -1208,21 +1209,21 @@ impl Store {
         let offset = inner.actual_size;
         let status = inner.crypter.as_ref().expect("crypter exists").status();
 
-        let mut entry = vec![0u8; total];
-        let written = write_entry_at(&mut entry, 0, key, blob, data_holder)?;
-        debug_assert_eq!(written, total);
-        inner
-            .crypter
-            .as_mut()
-            .expect("crypter exists")
-            .encrypt(&mut entry);
-
         {
+            // Encrypt in place over the mapping: the record used to be copied
+            // through a scratch `Vec` first.
             let data = inner.data.as_mut().ok_or_else(|| Error::FileNotValid {
                 path: self.path.to_string_lossy().into_owned(),
             })?;
             let buffer = data.bytes_mut();
-            buffer[FIXED32_SIZE + offset..FIXED32_SIZE + offset + total].copy_from_slice(&entry);
+            let start = FIXED32_SIZE + offset;
+            let written = write_entry_at(buffer, start, key, blob, data_holder)?;
+            debug_assert_eq!(written, total);
+            inner
+                .crypter
+                .as_mut()
+                .expect("crypter exists")
+                .encrypt(&mut buffer[start..start + total]);
         }
 
         let crc_digest = {
@@ -1241,26 +1242,29 @@ impl Store {
         if value_len == 0 {
             inner.dict_crypt.remove(key);
         } else {
-            let value_blob = if data_holder {
-                let mut value = Vec::with_capacity(blob.len() + varint_size_u32(blob.len() as u32));
-                crate::codec::varint::append_varint32(&mut value, blob.len() as u32);
-                value.extend_from_slice(blob);
-                value
-            } else {
-                blob.to_vec()
-            };
             let holder = if KeyValueHolderCrypt::is_value_stored_as_offset(value_len as usize) {
                 KeyValueHolderCrypt::offset(key.len() as u32, value_len, offset as u32, status)
                     .ok_or_else(|| Error::TooLarge {
                         key: String::from_utf8_lossy(key).into_owned(),
                         size: total,
                     })?
+            } else if data_holder {
+                let mut value = Vec::with_capacity(blob.len() + varint_size_u32(blob.len() as u32));
+                crate::codec::varint::append_varint32(&mut value, blob.len() as u32);
+                value.extend_from_slice(blob);
+                // Move the already-built blob into the holder instead of
+                // copying it a second time.
+                KeyValueHolderCrypt::from_owned(value)
             } else {
-                KeyValueHolderCrypt::from_value(&value_blob)
+                KeyValueHolderCrypt::from_value(blob)
             };
-            inner
-                .dict_crypt
-                .insert(key.to_vec().into_boxed_slice(), holder);
+            if let Some(slot) = inner.dict_crypt.get_mut(key) {
+                *slot = holder;
+            } else {
+                inner
+                    .dict_crypt
+                    .insert(key.to_vec().into_boxed_slice(), holder);
+            }
         }
 
         self.write_actual_size_locked(inner, new_actual, crc_digest, false, None)?;
@@ -1308,8 +1312,14 @@ impl Store {
                 key: String::from_utf8_lossy(key).into_owned(),
                 size: total,
             })?;
-        inner.dict.clear();
-        inner.dict.insert(key.to_vec().into_boxed_slice(), holder);
+        // Keep only the entry being overridden so its key allocation can be
+        // reused; `clear()` would free it and force a copy.
+        inner.dict.retain(|existing, _| existing.as_ref() == key);
+        if let Some(slot) = inner.dict.get_mut(key) {
+            *slot = holder;
+        } else {
+            inner.dict.insert(key.to_vec().into_boxed_slice(), holder);
+        }
 
         let crc_digest = {
             let bytes = data.bytes();
@@ -1325,9 +1335,10 @@ impl Store {
         key: &[u8],
         blob: &[u8],
         data_holder: bool,
-        value_len: u32,
         total: usize,
+        replace_existing: bool,
     ) -> Result<()> {
+        let value_len = encoded_value_length(blob, data_holder)?;
         self.ensure_memory_size_locked(inner, total)?;
         let offset = inner.actual_size;
         let data = inner.data.as_mut().ok_or_else(|| Error::FileNotValid {
@@ -1355,7 +1366,20 @@ impl Store {
                     key: String::from_utf8_lossy(key).into_owned(),
                     size: total,
                 })?;
-            inner.dict.insert(key.to_vec().into_boxed_slice(), holder);
+            // Updating an existing key only replaces the 12-byte holder; the
+            // map already owns the key bytes, so no allocation is needed here
+            // (C++: `itr->second = std::move(holder)`).
+            let replaced = replace_existing
+                && match inner.dict.get_mut(key) {
+                    Some(slot) => {
+                        *slot = holder;
+                        true
+                    }
+                    None => false,
+                };
+            if !replaced {
+                inner.dict.insert(key.to_vec().into_boxed_slice(), holder);
+            }
         }
 
         self.write_actual_size_locked(inner, new_actual, crc_digest, false, None)?;
@@ -1501,18 +1525,23 @@ impl Store {
     }
 
     fn do_full_write_back_plain_locked(&self, inner: &mut Inner, need_sync: bool) -> Result<()> {
-        let mut items: Vec<(Box<[u8]>, KeyValueHolder)> = inner
+        // C++ (`memmoveDictionary`) sorts pointers into the map and memmoves
+        // contiguous runs. Collecting only `(offset, size)` pairs avoids the
+        // per-key `Box<[u8]>` clone the rebuild used to make.
+        let mut items: Vec<(u32, u32)> = inner
             .dict
-            .iter()
-            .map(|(key, holder)| (key.clone(), *holder))
+            .values()
+            .map(|holder| {
+                (
+                    holder.offset,
+                    holder.computed_kv_size as u32 + holder.value_size,
+                )
+            })
             .collect();
-        items.sort_by_key(|(_, holder)| holder.offset);
+        items.sort_unstable_by_key(|item| item.0);
 
-        let total = ITEM_SIZE_HOLDER_SIZE
-            + items
-                .iter()
-                .map(|(_, holder)| holder.computed_kv_size as usize + holder.value_size as usize)
-                .sum::<usize>();
+        let total =
+            ITEM_SIZE_HOLDER_SIZE + items.iter().map(|(_, size)| *size as usize).sum::<usize>();
         let file_size = inner
             .data
             .as_ref()
@@ -1525,6 +1554,17 @@ impl Store {
             });
         }
 
+        // `(old_start, new_start, size)`; adjacent records are moved as one run.
+        let mut sections: Vec<(u32, u32, u32)> = Vec::new();
+        let mut write = ITEM_SIZE_HOLDER_SIZE as u32;
+        for (offset, size) in &items {
+            match sections.last_mut() {
+                Some(last) if *offset == last.0 + last.2 => last.2 += size,
+                _ => sections.push((*offset, write, *size)),
+            }
+            write += size;
+        }
+
         let crc_digest = {
             let data = inner.data.as_mut().expect("data exists");
             let buffer = data.bytes_mut();
@@ -1535,36 +1575,25 @@ impl Store {
                 output.write_varint32(FAKE_MAP_SIZE)?;
             }
 
-            let mut sections: Vec<(usize, usize)> = Vec::new();
-            for (_, holder) in &items {
-                let offset = holder.offset as usize;
-                let size = holder.computed_kv_size as usize + holder.value_size as usize;
-                if let Some(last) = sections.last_mut()
-                    && offset == last.0 + last.1
-                {
-                    last.1 += size;
-                    continue;
-                }
-                sections.push((offset, size));
+            for (old_start, new_start, size) in &sections {
+                let source = FIXED32_SIZE + *old_start as usize;
+                let destination = FIXED32_SIZE + *new_start as usize;
+                buffer.copy_within(source..source + *size as usize, destination);
             }
-
-            let mut write = ITEM_SIZE_HOLDER_SIZE;
-            for (offset, size) in sections {
-                let source = FIXED32_SIZE + offset;
-                let destination = FIXED32_SIZE + write;
-                buffer.copy_within(source..source + size, destination);
-                write += size;
-            }
-            debug_assert_eq!(write, total);
 
             crc32(0, &buffer[FIXED32_SIZE..FIXED32_SIZE + total])
         };
 
-        let mut offset = ITEM_SIZE_HOLDER_SIZE as u32;
-        for (key, mut holder) in items {
-            holder.offset = offset;
-            offset += holder.computed_kv_size as u32 + holder.value_size;
-            inner.dict.insert(key, holder);
+        // Records keep their relative order, so a holder's new offset is its
+        // section's new start plus its distance from the section start.
+        for holder in inner.dict.values_mut() {
+            if let Some(index) = sections
+                .partition_point(|section| section.0 <= holder.offset)
+                .checked_sub(1)
+            {
+                let (old_start, new_start, _) = sections[index];
+                holder.offset = new_start + (holder.offset - old_start);
+            }
         }
 
         inner.actual_size = total;
@@ -1578,28 +1607,164 @@ impl Store {
     }
 
     fn do_full_write_back_crypt_locked(&self, inner: &mut Inner, need_sync: bool) -> Result<()> {
-        let entries = {
-            let data = inner.data.as_ref().ok_or_else(|| Error::FileNotValid {
+        // C++ `memmoveDictionary(MMKVMapCrypt&)`: decrypt each run of
+        // offset-stored records straight into its compacted position, then
+        // re-encrypt the payload with a fresh IV, updating every holder in
+        // place. Peak memory is one record instead of the whole dictionary.
+        let file_size = inner
+            .data
+            .as_ref()
+            .map(MemoryFile::size)
+            .unwrap_or_default();
+
+        #[derive(Clone, Copy)]
+        struct Span {
+            offset: u32,
+            size: u32,
+            status: AesStatus,
+        }
+
+        let mut spans: Vec<Span> = Vec::new();
+        let mut total = ITEM_SIZE_HOLDER_SIZE;
+        for (key, holder) in &inner.dict_crypt {
+            match holder {
+                KeyValueHolderCrypt::Offset {
+                    pb_key_value_size,
+                    key_size,
+                    value_size,
+                    offset,
+                    status,
+                } => {
+                    let size = *pb_key_value_size as u32 + *key_size as u32 + *value_size;
+                    spans.push(Span {
+                        offset: *offset,
+                        size,
+                        status: *status,
+                    });
+                    total += size as usize;
+                }
+                KeyValueHolderCrypt::Direct(value) | KeyValueHolderCrypt::Memory(value) => {
+                    let (_, size) = encoded_entry(key, value, false)?;
+                    total = total.checked_add(size).ok_or_else(|| Error::TooLarge {
+                        key: "<compacted>".to_owned(),
+                        size: total,
+                    })?;
+                }
+            }
+        }
+        if total + FIXED32_SIZE > file_size {
+            return Err(Error::TooLarge {
+                key: "<compacted>".to_owned(),
+                size: total,
+            });
+        }
+        spans.sort_unstable_by_key(|span| span.offset);
+
+        // (old_start, new_start, size, status at the first record) plus the
+        // compacted position of every record.
+        let mut sections: Vec<(u32, u32, u32, AesStatus)> = Vec::new();
+        let mut placements: Vec<u32> = Vec::with_capacity(spans.len());
+        let mut write = ITEM_SIZE_HOLDER_SIZE as u32;
+        for span in &spans {
+            placements.push(write);
+            match sections.last_mut() {
+                Some(last) if span.offset == last.0 + last.2 => last.2 += span.size,
+                _ => sections.push((span.offset, write, span.size, span.status)),
+            }
+            write += span.size;
+        }
+
+        let mut iv = [0u8; AES_IV_LEN];
+        self.platform.random_bytes(&mut iv)?;
+
+        let mut offset = write;
+        let mut updates: Vec<(u32, u32, AesStatus)> = Vec::with_capacity(spans.len());
+        {
+            let data = inner.data.as_mut().ok_or_else(|| Error::FileNotValid {
                 path: self.path.to_string_lossy().into_owned(),
             })?;
-            let payload = data
-                .bytes()
-                .get(FIXED32_SIZE..)
-                .ok_or(Error::Corrupted(CorruptKind::Length))?;
-            let crypter = inner
+            let crypt = inner
                 .crypter
-                .as_ref()
+                .as_mut()
                 .ok_or(Error::Unsupported("encryption is not enabled"))?;
-            let mut entries = Vec::with_capacity(inner.dict_crypt.len());
-            for (key, holder) in &inner.dict_crypt {
-                let value = holder
-                    .value(payload, crypter)
-                    .ok_or(Error::Corrupted(CorruptKind::Length))?;
-                entries.push((key.clone(), value));
+            let buffer = data.bytes_mut();
+
+            // Compact the ciphertext runs, decrypting them in place.
+            for (old_start, new_start, size, status) in &sections {
+                let source = FIXED32_SIZE + *old_start as usize;
+                let destination = FIXED32_SIZE + *new_start as usize;
+                let size = *size as usize;
+                buffer.copy_within(source..source + size, destination);
+                crypt.set_status(status);
+                crypt.decrypt(&mut buffer[destination..destination + size]);
             }
-            entries
+
+            // Placeholder, then the records, all on the fresh stream.
+            {
+                let mut output = CodedOutput::new(
+                    &mut buffer[FIXED32_SIZE..FIXED32_SIZE + ITEM_SIZE_HOLDER_SIZE],
+                );
+                output.write_varint32(FAKE_MAP_SIZE)?;
+            }
+            crypt.reset_iv(Some(&iv));
+            crypt.encrypt(&mut buffer[FIXED32_SIZE..FIXED32_SIZE + ITEM_SIZE_HOLDER_SIZE]);
+
+            for (span, new_start) in spans.iter().zip(&placements) {
+                let start = FIXED32_SIZE + *new_start as usize;
+                let status = crypt.status();
+                crypt.encrypt(&mut buffer[start..start + span.size as usize]);
+                updates.push((span.offset, *new_start, status));
+            }
+
+            // Small values live in the holder, so they are re-serialized after
+            // the moved records (C++ `preparedData`). Key order keeps the
+            // output deterministic.
+            let mut small: Vec<&[u8]> = inner
+                .dict_crypt
+                .iter()
+                .filter(|(_, holder)| !matches!(holder, KeyValueHolderCrypt::Offset { .. }))
+                .map(|(key, _)| key.as_ref())
+                .collect();
+            small.sort_unstable();
+            for key in small {
+                let Some(KeyValueHolderCrypt::Direct(value) | KeyValueHolderCrypt::Memory(value)) =
+                    inner.dict_crypt.get(key)
+                else {
+                    continue;
+                };
+                let start = FIXED32_SIZE + offset as usize;
+                let size = write_entry_at(buffer, start, key, value, false)?;
+                crypt.encrypt(&mut buffer[start..start + size]);
+                offset += size as u32;
+            }
+        }
+        debug_assert_eq!(offset as usize, total);
+
+        for holder in inner.dict_crypt.values_mut() {
+            if let KeyValueHolderCrypt::Offset { offset, status, .. } = holder
+                && let Some(index) = updates
+                    .partition_point(|update| update.0 <= *offset)
+                    .checked_sub(1)
+                && updates[index].0 == *offset
+            {
+                *offset = updates[index].1;
+                *status = updates[index].2;
+            }
+        }
+
+        let crc_digest = {
+            let data = inner.data.as_ref().expect("data exists");
+            crc32(0, &data.bytes()[FIXED32_SIZE..FIXED32_SIZE + total])
         };
-        self.write_all_entries_locked(inner, entries, need_sync)
+
+        inner.actual_size = total;
+        inner.output_position = total;
+        self.write_actual_size_locked(inner, total, crc_digest, true, Some(&iv))?;
+        inner.has_full_writeback = true;
+        if need_sync {
+            self.sync_locked(inner, SyncMode::Sync)?;
+        }
+        Ok(())
     }
 
     /// Rewrite the whole store from plaintext value blobs. Used by encryption
@@ -1616,10 +1781,12 @@ impl Store {
         let mut total = ITEM_SIZE_HOLDER_SIZE;
         for (key, value) in &entries {
             let (_, entry_size) = encoded_entry(key, value, false)?;
-            total = total.checked_add(entry_size).ok_or(Error::TooLarge {
-                key: "<compacted>".to_owned(),
-                size: total,
-            })?;
+            total = total
+                .checked_add(entry_size)
+                .ok_or_else(|| Error::TooLarge {
+                    key: "<compacted>".to_owned(),
+                    size: total,
+                })?;
         }
         self.ensure_capacity_locked(inner, total)?;
 
@@ -1668,21 +1835,17 @@ impl Store {
                 None
             };
 
-            let mut entry = vec![0u8; entry_size];
-            write_entry_at(&mut entry, 0, &key, &value, false)?;
-            if encrypted {
-                inner
-                    .crypter
-                    .as_mut()
-                    .expect("crypter exists")
-                    .encrypt(&mut entry);
-            }
             {
+                // Write the record straight into the mapping and encrypt it in
+                // place; no per-entry scratch buffer (C++ reuses the file).
                 let data = inner.data.as_mut().expect("data exists");
+                let buffer = data.bytes_mut();
                 let start = FIXED32_SIZE + offset as usize;
-                data.bytes_mut()[start..start + entry_size].copy_from_slice(&entry);
+                write_entry_at(buffer, start, &key, &value, false)?;
+                if let Some(crypter) = inner.crypter.as_mut() {
+                    crypter.encrypt(&mut buffer[start..start + entry_size]);
+                }
             }
-
             if let Some(status) = status {
                 let holder = if KeyValueHolderCrypt::is_value_stored_as_offset(value_len as usize) {
                     KeyValueHolderCrypt::offset(key.len() as u32, value_len, offset, status)
@@ -1901,14 +2064,14 @@ impl Store {
         f(&mut inner)
     }
 
-    fn value_for_inner(&self, inner: &Inner, holder: KeyValueHolder) -> Option<Vec<u8>> {
+    fn value_for_inner<'a>(&self, inner: &'a Inner, holder: KeyValueHolder) -> Option<&'a [u8]> {
         let data = inner.data.as_ref()?;
         let payload = data.bytes().get(FIXED32_SIZE..)?;
-        holder.value(payload).map(|value| value.to_vec())
+        holder.value(payload)
     }
 
     /// Value blob exactly as stored, without expiration stripping.
-    fn value_blob_raw(&self, inner: &Inner, key: &[u8]) -> Option<Vec<u8>> {
+    fn value_blob_raw<'a>(&self, inner: &'a Inner, key: &[u8]) -> Option<Cow<'a, [u8]>> {
         if let Some(crypter) = inner.crypter.as_ref() {
             let holder = inner.dict_crypt.get(key)?;
             let data = inner.data.as_ref()?;
@@ -1916,29 +2079,116 @@ impl Store {
             holder.value(payload, crypter)
         } else {
             let holder = *inner.dict.get(key)?;
-            self.value_for_inner(inner, holder)
+            self.value_for_inner(inner, holder).map(Cow::Borrowed)
+        }
+    }
+
+    /// `Some(true)` when the key is present and past its expiration date,
+    /// `Some(false)` when it is alive, `None` when it is absent.
+    fn value_expired(&self, inner: &Inner, key: &[u8]) -> Option<bool> {
+        let now = self.platform.now_unix_seconds();
+        let data = inner.data.as_ref()?;
+        let payload = data.bytes().get(FIXED32_SIZE..)?;
+        if let Some(crypter) = inner.crypter.as_ref() {
+            let holder = inner.dict_crypt.get(key)?;
+            Some(crypt_value_expired(holder, payload, crypter, now))
+        } else {
+            let holder = *inner.dict.get(key)?;
+            Some(plain_value_expired(holder, payload, now))
+        }
+    }
+
+    /// Append the tombstone for an expired key, upgrading to the exclusive
+    /// process lock first.
+    ///
+    /// The lock upgrade can wait for another process, so the loaded state is
+    /// refreshed afterwards; appending at a stale `actual_size` would overwrite
+    /// a record written in the meantime.
+    fn expire_key_locked(&self, inner: &mut Inner, key: &[u8]) {
+        let Ok(_guard) = self.lock.exclusive_guard() else {
+            return;
+        };
+        if self.ensure_loaded_locked(inner).is_err() {
+            return;
+        }
+        // Another process may have refreshed the value while the upgrade was
+        // waiting; only delete it if it is still expired.
+        if self.value_expired(inner, key) == Some(true) {
+            let _ = self.remove_locked(inner, key);
         }
     }
 
     /// Read a value and delete it immediately when it has expired (MMKV's
     /// `getDataWithoutMTimeForKey` appends a tombstone on read).
-    fn raw_blob_mut(&self, inner: &mut Inner, key: &[u8]) -> Option<Vec<u8>> {
-        let value = self.value_blob_raw(inner, key)?;
-        if inner.expiration_enabled {
-            if value.len() < FIXED32_SIZE {
-                return None;
-            }
-            let time =
-                u32::from_le_bytes(value[value.len() - 4..].try_into().expect("length checked"));
-            if time != 0 && time <= self.platform.now_unix_seconds() {
-                // Upgrade the shared lock to exclusive before writing a tombstone.
-                let _guard = self.lock.exclusive_guard().ok()?;
-                let _ = self.remove_locked(inner, key);
-                return None;
-            }
-            return Some(value[..value.len() - FIXED32_SIZE].to_vec());
+    ///
+    /// Plaintext and cached crypt values are returned borrowed from the
+    /// mapping; only offset-stored ciphertext is decrypted into a buffer. The
+    /// expiration trailer is inspected separately, so a live value is decrypted
+    /// exactly once.
+    fn read_blob<'a>(&self, inner: &'a mut Inner, key: &[u8]) -> Option<Cow<'a, [u8]>> {
+        if !inner.expiration_enabled {
+            return self.value_blob_raw(inner, key);
         }
-        Some(value)
+        let now = self.platform.now_unix_seconds();
+
+        if inner.crypter.is_some() {
+            // A crypt holder cannot be copied out of the map, so the trailer
+            // check and the value read each look it up again.
+            let expired = {
+                let crypter = inner.crypter.as_ref()?;
+                let holder = inner.dict_crypt.get(key)?;
+                let payload = inner.data.as_ref()?.bytes().get(FIXED32_SIZE..)?;
+                crypt_value_expired(holder, payload, crypter, now)
+            };
+            if expired {
+                self.expire_key_locked(inner, key);
+                return None;
+            }
+            let value = {
+                let crypter = inner.crypter.as_ref()?;
+                let holder = inner.dict_crypt.get(key)?;
+                let payload = inner.data.as_ref()?.bytes().get(FIXED32_SIZE..)?;
+                holder.value(payload, crypter)?
+            };
+            return Some(strip_expiration_trailer(value));
+        }
+
+        // Plaintext: the 12-byte holder is `Copy`, so one map probe is enough.
+        let holder = *inner.dict.get(key)?;
+        let expired = {
+            let payload = inner.data.as_ref()?.bytes().get(FIXED32_SIZE..)?;
+            plain_value_expired(holder, payload, now)
+        };
+        if expired {
+            self.expire_key_locked(inner, key);
+            return None;
+        }
+        let value = self.value_for_inner(inner, holder)?;
+        Some(strip_expiration_trailer(Cow::Borrowed(value)))
+    }
+
+    /// Run `f` with the raw value blob while the store lock is held.
+    ///
+    /// The slice cannot escape (`f` is higher-ranked), so plaintext and cached
+    /// crypt values are served without the extra copy each getter used to make.
+    fn with_blob<R>(&self, key: &str, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
+        self.touch();
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return f(None);
+        }
+        let _guard = match self.lock.shared_guard() {
+            Ok(guard) => guard,
+            Err(_) => return f(None),
+        };
+        if self.ensure_loaded_locked(&mut inner).is_err() {
+            return f(None);
+        }
+        match self.read_blob(&mut inner, key.as_bytes()) {
+            Some(Cow::Borrowed(value)) => f(Some(value)),
+            Some(Cow::Owned(value)) => f(Some(&value)),
+            None => f(None),
+        }
     }
 
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
@@ -1946,11 +2196,7 @@ impl Store {
     }
 
     pub fn get_bool_opt(&self, key: &str) -> Option<bool> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_bool(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_bool(blob?).ok())
     }
 
     pub fn get_i32(&self, key: &str, default: i32) -> i32 {
@@ -1958,11 +2204,7 @@ impl Store {
     }
 
     pub fn get_i32_opt(&self, key: &str) -> Option<i32> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_i32(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_i32(blob?).ok())
     }
 
     pub fn get_u32(&self, key: &str, default: u32) -> u32 {
@@ -1970,11 +2212,7 @@ impl Store {
     }
 
     pub fn get_u32_opt(&self, key: &str) -> Option<u32> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_u32(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_u32(blob?).ok())
     }
 
     pub fn get_i64(&self, key: &str, default: i64) -> i64 {
@@ -1982,11 +2220,7 @@ impl Store {
     }
 
     pub fn get_i64_opt(&self, key: &str) -> Option<i64> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_i64(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_i64(blob?).ok())
     }
 
     pub fn get_u64(&self, key: &str, default: u64) -> u64 {
@@ -1994,11 +2228,7 @@ impl Store {
     }
 
     pub fn get_u64_opt(&self, key: &str) -> Option<u64> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_u64(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_u64(blob?).ok())
     }
 
     pub fn get_f32(&self, key: &str, default: f32) -> f32 {
@@ -2006,11 +2236,7 @@ impl Store {
     }
 
     pub fn get_f32_opt(&self, key: &str) -> Option<f32> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_f32(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_f32(blob?).ok())
     }
 
     pub fn get_f64(&self, key: &str, default: f64) -> f64 {
@@ -2018,19 +2244,13 @@ impl Store {
     }
 
     pub fn get_f64_opt(&self, key: &str) -> Option<f64> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_f64(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_f64(blob?).ok())
     }
 
     pub fn get_str(&self, key: &str) -> Option<String> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_str(&blob).ok().map(str::to_owned)
+        self.with_blob(key, |blob| {
+            mini_pb::decode_str(blob?).ok().map(str::to_owned)
+        })
     }
 
     pub fn get_str_or(&self, key: &str, default: &str) -> String {
@@ -2039,43 +2259,36 @@ impl Store {
 
     /// C++ `getString(key, result, inplaceModification=true)` equivalent.
     pub fn get_str_into(&self, key: &str, result: &mut String) -> bool {
-        let Some(blob) = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()
-        else {
-            return false;
-        };
-        match mini_pb::decode_str(&blob) {
-            Ok(value) => {
-                result.clear();
-                result.push_str(value);
-                true
+        self.with_blob(key, |blob| {
+            match blob.and_then(|blob| mini_pb::decode_str(blob).ok()) {
+                Some(value) => {
+                    result.clear();
+                    result.push_str(value);
+                    true
+                }
+                None => false,
             }
-            Err(_) => false,
-        }
+        })
     }
 
     /// Scoped read of a byte value. The closure runs while the store lock is
-    /// held, avoiding an extra caller-side copy of the decoded value.
+    /// held and the slice is borrowed from the mapping, so no copy is made.
     pub fn with_bytes<R>(&self, key: &str, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
-        match self.with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes())) {
-            Ok(Some(blob)) => match mini_pb::decode_bytes(&blob) {
-                Ok(value) => f(Some(value)),
-                Err(_) => f(None),
-            },
-            _ => f(None),
-        }
+        self.with_blob(key, |blob| {
+            match blob.and_then(|blob| mini_pb::decode_bytes(blob).ok()) {
+                Some(value) => f(Some(value)),
+                None => f(None),
+            }
+        })
     }
 
     pub fn with_str<R>(&self, key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
-        match self.with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes())) {
-            Ok(Some(blob)) => match mini_pb::decode_str(&blob) {
-                Ok(value) => f(Some(value)),
-                Err(_) => f(None),
-            },
-            _ => f(None),
-        }
+        self.with_blob(key, |blob| {
+            match blob.and_then(|blob| mini_pb::decode_str(blob).ok()) {
+                Some(value) => f(Some(value)),
+                None => f(None),
+            }
+        })
     }
 
     pub fn get_bytes_or(&self, key: &str, default: &[u8]) -> Vec<u8> {
@@ -2083,11 +2296,9 @@ impl Store {
     }
 
     pub fn get_bytes(&self, key: &str) -> Option<Vec<u8>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_bytes(&blob).ok().map(<[u8]>::to_vec)
+        self.with_blob(key, |blob| {
+            mini_pb::decode_bytes(blob?).ok().map(<[u8]>::to_vec)
+        })
     }
 
     pub fn get_strings_or(&self, key: &str, default: &[String]) -> Vec<String> {
@@ -2095,114 +2306,116 @@ impl Store {
     }
 
     pub fn get_strings(&self, key: &str) -> Option<Vec<String>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_strings(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_strings(blob?).ok())
     }
 
     pub fn get_bool_vec(&self, key: &str) -> Option<Vec<bool>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_bool_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_bool_vec(blob?).ok())
     }
 
     pub fn get_i32_vec(&self, key: &str) -> Option<Vec<i32>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_i32_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_i32_vec(blob?).ok())
     }
 
     pub fn get_u32_vec(&self, key: &str) -> Option<Vec<u32>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_u32_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_u32_vec(blob?).ok())
     }
 
     pub fn get_i64_vec(&self, key: &str) -> Option<Vec<i64>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_i64_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_i64_vec(blob?).ok())
     }
 
     pub fn get_u64_vec(&self, key: &str) -> Option<Vec<u64>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_u64_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_u64_vec(blob?).ok())
     }
 
     pub fn get_f32_vec(&self, key: &str) -> Option<Vec<f32>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_f32_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_f32_vec(blob?).ok())
     }
 
     pub fn get_f64_vec(&self, key: &str) -> Option<Vec<f64>> {
-        let blob = self
-            .with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-            .ok()
-            .flatten()?;
-        mini_pb::decode_f64_vec(&blob).ok()
+        self.with_blob(key, |blob| mini_pb::decode_f64_vec(blob?).ok())
     }
 
+    /// C++ `containsKey`: with expiration enabled an expired key reports
+    /// `false` and is deleted on the spot.
     pub fn contains(&self, key: &str) -> bool {
         self.with_shared(|inner| {
-            if inner.crypter.is_some() {
-                inner.dict_crypt.contains_key(key.as_bytes())
-            } else {
-                inner.dict.contains_key(key.as_bytes())
+            if !inner.expiration_enabled {
+                return if inner.crypter.is_some() {
+                    inner.dict_crypt.contains_key(key.as_bytes())
+                } else {
+                    inner.dict.contains_key(key.as_bytes())
+                };
+            }
+            match self.value_expired(inner, key.as_bytes()) {
+                None => false,
+                Some(false) => true,
+                Some(true) => {
+                    self.expire_key_locked(inner, key.as_bytes());
+                    false
+                }
             }
         })
         .unwrap_or(false)
     }
 
     pub fn all_keys(&self) -> Vec<String> {
+        self.with_shared(|inner| Self::all_keys_locked(inner))
+            .unwrap_or_default()
+    }
+
+    /// Keys that are not expired. Unlike MMKV's writable `filterExpire` paths
+    /// this does not rewrite the store.
+    ///
+    /// Only the returned strings are allocated; the map and the expiration
+    /// trailers are read in place.
+    pub fn all_keys_non_expired(&self) -> Vec<String> {
         self.with_shared(|inner| {
-            if inner.crypter.is_some() {
+            if !inner.expiration_enabled {
+                return Self::all_keys_locked(inner);
+            }
+            let now = self.platform.now_unix_seconds();
+            let Some(payload) = inner
+                .data
+                .as_ref()
+                .and_then(|data| data.bytes().get(FIXED32_SIZE..))
+            else {
+                return Vec::new();
+            };
+            if let Some(crypter) = inner.crypter.as_ref() {
                 inner
                     .dict_crypt
-                    .keys()
-                    .map(|key| String::from_utf8_lossy(key).into_owned())
+                    .iter()
+                    .filter(|(_, holder)| !crypt_value_expired(holder, payload, crypter, now))
+                    .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
                     .collect()
             } else {
                 inner
                     .dict
-                    .keys()
-                    .map(|key| String::from_utf8_lossy(key).into_owned())
+                    .iter()
+                    .filter(|(_, holder)| !plain_value_expired(**holder, payload, now))
+                    .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
                     .collect()
             }
         })
         .unwrap_or_default()
     }
 
-    /// Keys that are not expired. Unlike MMKV's writable `filterExpire` paths
-    /// this does not rewrite the store.
-    pub fn all_keys_non_expired(&self) -> Vec<String> {
-        self.with_shared(|inner| {
-            let keys: Vec<Box<[u8]>> = if inner.crypter.is_some() {
-                inner.dict_crypt.keys().cloned().collect()
-            } else {
-                inner.dict.keys().cloned().collect()
-            };
-            keys.into_iter()
-                .filter(|key| !self.is_expired_key(inner, key))
-                .map(|key| String::from_utf8_lossy(&key).into_owned())
+    fn all_keys_locked(inner: &Inner) -> Vec<String> {
+        if inner.crypter.is_some() {
+            inner
+                .dict_crypt
+                .keys()
+                .map(|key| String::from_utf8_lossy(key).into_owned())
                 .collect()
-        })
-        .unwrap_or_default()
+        } else {
+            inner
+                .dict
+                .keys()
+                .map(|key| String::from_utf8_lossy(key).into_owned())
+                .collect()
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -2230,34 +2443,32 @@ impl Store {
 
     pub fn count_non_expired(&self) -> usize {
         self.with_shared(|inner| {
-            let keys: Vec<Box<[u8]>> = if inner.crypter.is_some() {
-                inner.dict_crypt.keys().cloned().collect()
-            } else {
-                inner.dict.keys().cloned().collect()
+            if !inner.expiration_enabled {
+                return Self::dictionary_len(inner);
+            }
+            let now = self.platform.now_unix_seconds();
+            let Some(payload) = inner
+                .data
+                .as_ref()
+                .and_then(|data| data.bytes().get(FIXED32_SIZE..))
+            else {
+                return 0;
             };
-            keys.into_iter()
-                .filter(|key| !self.is_expired_key(inner, key))
-                .count()
+            if let Some(crypter) = inner.crypter.as_ref() {
+                inner
+                    .dict_crypt
+                    .values()
+                    .filter(|holder| !crypt_value_expired(holder, payload, crypter, now))
+                    .count()
+            } else {
+                inner
+                    .dict
+                    .values()
+                    .filter(|holder| !plain_value_expired(**holder, payload, now))
+                    .count()
+            }
         })
         .unwrap_or(0)
-    }
-
-    fn is_expired_key(&self, inner: &Inner, key: &[u8]) -> bool {
-        if !inner.expiration_enabled {
-            return false;
-        }
-        let Some(value) = self.value_blob_raw(inner, key) else {
-            return false;
-        };
-        if value.len() < FIXED32_SIZE {
-            return false;
-        }
-        let time = u32::from_le_bytes(
-            value[value.len() - FIXED32_SIZE..]
-                .try_into()
-                .expect("length checked"),
-        );
-        time != 0 && time <= self.platform.now_unix_seconds()
     }
 
     pub fn total_size(&self) -> usize {
@@ -2270,42 +2481,46 @@ impl Store {
     }
 
     pub fn value_size(&self, key: &str, actual: bool) -> usize {
-        let Ok(Some(blob)) = self.with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))
-        else {
-            return 0;
-        };
-        if actual {
-            let mut input = CodedInput::new(&blob);
-            if let Ok(length) = input.read_u32()
-                && varint_size_u32(length) + length as usize == blob.len()
-            {
-                return length as usize;
+        self.with_shared(|inner| {
+            let Some(blob) = self.read_blob(inner, key.as_bytes()) else {
+                return 0;
+            };
+            if actual {
+                let mut input = CodedInput::new(&blob);
+                if let Ok(length) = input.read_u32()
+                    && varint_size_u32(length) + length as usize == blob.len()
+                {
+                    return length as usize;
+                }
             }
-        }
-        blob.len()
+            blob.len()
+        })
+        .unwrap_or(0)
     }
 
     pub fn write_value(&self, key: &str, out: &mut [u8]) -> Result<usize> {
-        let Some(blob) = self.with_shared(|inner| self.raw_blob_mut(inner, key.as_bytes()))? else {
-            return Err(Error::InvalidId(key.to_owned()));
-        };
-        let mut input = CodedInput::new(&blob);
-        if let Ok(length) = input.read_i32() {
-            let prefix = varint_size_i32(length);
-            if length >= 0 {
-                let length = length as usize;
-                if prefix + length == blob.len() {
-                    if length <= out.len() {
-                        out[..length].copy_from_slice(&blob[prefix..prefix + length]);
-                        return Ok(length);
+        self.with_shared(|inner| {
+            let Some(blob) = self.read_blob(inner, key.as_bytes()) else {
+                return Err(Error::InvalidId(key.to_owned()));
+            };
+            let mut input = CodedInput::new(&blob);
+            if let Ok(length) = input.read_i32() {
+                let prefix = varint_size_i32(length);
+                if length >= 0 {
+                    let length = length as usize;
+                    if prefix + length == blob.len() {
+                        if length <= out.len() {
+                            out[..length].copy_from_slice(&blob[prefix..prefix + length]);
+                            return Ok(length);
+                        }
+                    } else if blob.len() <= out.len() {
+                        out[..blob.len()].copy_from_slice(&blob);
+                        return Ok(blob.len());
                     }
-                } else if blob.len() <= out.len() {
-                    out[..blob.len()].copy_from_slice(&blob);
-                    return Ok(blob.len());
                 }
             }
-        }
-        Err(Error::Corrupted(CorruptKind::Length))
+            Err(Error::Corrupted(CorruptKind::Length))
+        })?
     }
 
     // ── public writes ───────────────────────────────────────────────────
@@ -2458,11 +2673,44 @@ impl Store {
         self.with_exclusive(|inner| self.remove_locked(inner, key.as_bytes()))
     }
 
+    /// C++ `removeValuesForKeys`: erase the keys and compact once, instead of
+    /// appending one tombstone (and one metadata write) per key.
     pub fn remove_many(&self, keys: &[&str]) -> Result<()> {
-        for key in keys {
-            let _ = self.remove(key)?;
+        match keys.len() {
+            0 => return Ok(()),
+            1 => {
+                self.remove(keys[0])?;
+                return Ok(());
+            }
+            _ => {}
         }
-        Ok(())
+        self.with_exclusive(|inner| {
+            let mut removed = 0usize;
+            for key in keys {
+                if key.is_empty() {
+                    continue;
+                }
+                let existed = if inner.crypter.is_some() {
+                    inner.dict_crypt.remove(key.as_bytes()).is_some()
+                } else {
+                    inner.dict.remove(key.as_bytes()).is_some()
+                };
+                removed += usize::from(existed);
+            }
+            if removed == 0 {
+                return Ok(());
+            }
+            inner.has_full_writeback = false;
+            match self.full_writeback_locked(inner) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Drop the divergent in-memory view; the next access reloads
+                    // the untouched file (C++ `clearMemoryCache` on failure).
+                    self.clear_memory_cache_locked(inner, false);
+                    Err(error)
+                }
+            }
+        })
     }
 
     pub fn clear(&self) {
@@ -2677,33 +2925,48 @@ impl Store {
         for key in keys {
             let value = self
                 .value_blob_raw(inner, &key)
-                .ok_or(Error::Corrupted(CorruptKind::Length))?;
+                .ok_or(Error::Corrupted(CorruptKind::Length))?
+                .into_owned();
             entries.push((key, value));
         }
         Ok(entries)
     }
 
+    /// C++ `filterExpiredKeys`: erase expired entries in place. The former
+    /// port cloned every key into a side vector first.
     fn filter_expired_locked(&self, inner: &mut Inner) -> usize {
-        if !inner.expiration_enabled {
+        if !inner.expiration_enabled || Self::dictionary_is_empty(inner) {
             return 0;
         }
-        let keys: Vec<Box<[u8]>> = if inner.crypter.is_some() {
-            inner.dict_crypt.keys().cloned().collect()
-        } else {
-            inner.dict.keys().cloned().collect()
+        let now = self.platform.now_unix_seconds();
+        let Inner {
+            data,
+            crypter,
+            dict,
+            dict_crypt,
+            ..
+        } = inner;
+        let Some(payload) = data
+            .as_ref()
+            .and_then(|data| data.bytes().get(FIXED32_SIZE..))
+        else {
+            return 0;
         };
-        let expired: Vec<Box<[u8]>> = keys
-            .into_iter()
-            .filter(|key| self.is_expired_key(inner, key))
-            .collect();
-        for key in &expired {
-            if inner.crypter.is_some() {
-                inner.dict_crypt.remove(key);
-            } else {
-                inner.dict.remove(key);
-            }
+        let mut removed = 0usize;
+        if let Some(crypter) = crypter.as_ref() {
+            dict_crypt.retain(|_, holder| {
+                let expired = crypt_value_expired(holder, payload, crypter, now);
+                removed += usize::from(expired);
+                !expired
+            });
+        } else {
+            dict.retain(|_, holder| {
+                let expired = plain_value_expired(*holder, payload, now);
+                removed += usize::from(expired);
+                !expired
+            });
         }
-        expired.len()
+        removed
     }
 
     pub fn enable_expiration(&self, seconds: u32) -> Result<()> {
@@ -2784,7 +3047,7 @@ impl Store {
 
         let mut count = 0usize;
         for key in keys {
-            let Some(blob) = src.raw_blob_mut(src_inner, &key) else {
+            let Some(blob) = src.read_blob(src_inner, &key) else {
                 continue;
             };
             if blob.is_empty() {
@@ -2945,6 +3208,42 @@ fn write_entry_at(
     output.write_raw(blob)?;
     debug_assert_eq!(output.position(), total);
     Ok(total)
+}
+
+/// Drop the 4-byte expiration trailer, if the value is long enough to have one.
+///
+/// C++ returns shorter values unchanged.
+fn strip_expiration_trailer(value: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+    if value.len() < FIXED32_SIZE {
+        return value;
+    }
+    match value {
+        Cow::Borrowed(slice) => Cow::Borrowed(&slice[..slice.len() - FIXED32_SIZE]),
+        Cow::Owned(mut owned) => {
+            owned.truncate(owned.len() - FIXED32_SIZE);
+            Cow::Owned(owned)
+        }
+    }
+}
+
+/// Expiration check for plaintext holders (reads the value tail in place).
+fn plain_value_expired(holder: KeyValueHolder, payload: &[u8], now: u32) -> bool {
+    holder
+        .expiry(payload)
+        .is_some_and(|time| time != 0 && time <= now)
+}
+
+/// Expiration check for crypt holders (only the 4-byte trailer is decrypted
+/// for offset-stored values).
+fn crypt_value_expired(
+    holder: &KeyValueHolderCrypt,
+    payload: &[u8],
+    crypter: &AesCrypt,
+    now: u32,
+) -> bool {
+    holder
+        .expiry(payload, crypter)
+        .is_some_and(|time| time != 0 && time <= now)
 }
 
 fn equal_encoded(old: &[u8], blob: &[u8], data_holder: bool) -> bool {

@@ -112,7 +112,7 @@ store.put_str("token", "secret")?;
 cargo test --workspace
 ```
 
-65 个测试：
+80 个测试（Linux/Windows 不含 Apple 平台套件时为 74 个）：
 
 | 测试套件 | 覆盖内容 |
 |---|---|

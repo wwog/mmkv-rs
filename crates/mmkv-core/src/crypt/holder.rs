@@ -5,6 +5,8 @@
 //! * `Offset`: value stays encrypted in the mapped file; decrypted on demand
 //!   using the CFB status captured at the record start.
 
+use std::borrow::Cow;
+
 use crate::codec::varint::varint_size_u32;
 use crate::crypt::aes::{AesCrypt, AesStatus};
 
@@ -32,6 +34,15 @@ impl KeyValueHolderCrypt {
             Self::Direct(value.to_vec())
         } else {
             Self::Memory(value.to_vec())
+        }
+    }
+
+    /// Same tiers as `from_value`, but takes ownership of the buffer.
+    pub fn from_owned(value: Vec<u8>) -> Self {
+        if value.len() <= SMALL_BUFFER_SIZE {
+            Self::Direct(value)
+        } else {
+            Self::Memory(value)
         }
     }
 
@@ -63,28 +74,64 @@ impl KeyValueHolderCrypt {
         }
     }
 
-    /// Decrypt (or return the cached) value blob. The returned bytes are the
-    /// value as stored on disk, i.e. what MMKV's getters expect.
-    pub fn value(&self, payload: &[u8], crypter: &AesCrypt) -> Option<Vec<u8>> {
+    /// Expiration trailer (`u32 LE`) of the value.
+    ///
+    /// Cached values are read in place. Offset-held ciphertext only needs the
+    /// four trailer bytes decrypted, using the O(1) CFB status reconstruction,
+    /// instead of decrypting the whole value to inspect its tail.
+    ///
+    /// `None` when the value is too short to carry a trailer.
+    pub fn expiry(&self, payload: &[u8], crypter: &AesCrypt) -> Option<u32> {
         match self {
-            Self::Direct(value) | Self::Memory(value) => Some(value.clone()),
+            Self::Direct(value) | Self::Memory(value) => {
+                let start = value.len().checked_sub(4)?;
+                Some(u32::from_le_bytes(value[start..].try_into().ok()?))
+            }
             Self::Offset {
                 pb_key_value_size,
                 key_size,
                 value_size,
                 offset,
-                status,
+                ..
             } => {
-                let prefix = *pb_key_value_size as usize + *key_size as usize;
-                let start = *offset as usize;
-                let end = start
-                    .checked_add(prefix)?
-                    .checked_add(*value_size as usize)?;
+                let start = (*offset as usize)
+                    .checked_add(*pb_key_value_size as usize)?
+                    .checked_add(*key_size as usize)?;
+                let end = start.checked_add(*value_size as usize)?;
+                let trailer = end.checked_sub(4)?;
+                if end > payload.len() {
+                    return None;
+                }
+                let mut output = [0u8; 4];
+                crypter.decrypt_at(payload, trailer, &mut output);
+                Some(u32::from_le_bytes(output))
+            }
+        }
+    }
+
+    /// Decrypt (or return the cached) value blob. The returned bytes are the
+    /// value as stored on disk, i.e. what MMKV's getters expect.
+    ///
+    /// Offset holders decrypt straight from the mapping at the value start, so
+    /// no cipher clone and no prefix decryption are needed.
+    pub fn value<'a>(&'a self, payload: &'a [u8], crypter: &AesCrypt) -> Option<Cow<'a, [u8]>> {
+        match self {
+            Self::Direct(value) | Self::Memory(value) => Some(Cow::Borrowed(value)),
+            Self::Offset {
+                pb_key_value_size,
+                key_size,
+                value_size,
+                offset,
+                ..
+            } => {
+                let start = (*offset as usize)
+                    .checked_add(*pb_key_value_size as usize)?
+                    .checked_add(*key_size as usize)?;
+                let end = start.checked_add(*value_size as usize)?;
                 let ciphertext = payload.get(start..end)?;
-                let mut crypto = crypter.clone_with_status(status);
                 let mut plaintext = vec![0u8; ciphertext.len()];
-                crypto.decrypt_to(ciphertext, &mut plaintext);
-                Some(plaintext[prefix..].to_vec())
+                crypter.decrypt_at(payload, start, &mut plaintext);
+                Some(Cow::Owned(plaintext))
             }
         }
     }
@@ -106,6 +153,45 @@ mod tests {
         ));
         assert!(!KeyValueHolderCrypt::is_value_stored_as_offset(256));
         assert!(KeyValueHolderCrypt::is_value_stored_as_offset(257));
+    }
+
+    #[test]
+    fn offset_expiry_decrypts_only_the_trailer() {
+        use crate::codec::varint::append_varint32;
+
+        let key = b"0123456789abcdef";
+        let iv = [3u8; 16];
+        let mut crypt = AesCrypt::new(key, false);
+        crypt.reset_iv(Some(&iv));
+
+        let record_key = b"expiring";
+        let timestamp = 1_700_000_000u32;
+        let mut value = vec![7u8; 300];
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        let value_size = value.len() as u32;
+
+        let mut payload = Vec::new();
+        append_varint32(&mut payload, 0x20_0000);
+        // The placeholder is part of the CFB stream, as in a real file.
+        crypt.encrypt(&mut payload[0..4]);
+        let status = crypt.status();
+        append_varint32(&mut payload, record_key.len() as u32);
+        payload.extend_from_slice(record_key);
+        append_varint32(&mut payload, value_size);
+        payload.extend_from_slice(&value);
+        crypt.encrypt(&mut payload[4..]);
+
+        let holder =
+            KeyValueHolderCrypt::offset(record_key.len() as u32, value_size, 4, status).unwrap();
+        assert_eq!(holder.expiry(&payload, &crypt), Some(timestamp));
+        // The value is still readable through the normal path.
+        assert_eq!(
+            holder.value(&payload, &crypt).as_deref(),
+            Some(value.as_slice())
+        );
+
+        let short = KeyValueHolderCrypt::from_value(&[1, 2, 3]);
+        assert_eq!(short.expiry(&payload, &crypt), None);
     }
 
     #[test]

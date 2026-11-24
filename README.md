@@ -115,7 +115,7 @@ store.put_str("token", "secret")?;
 cargo test --workspace
 ```
 
-68 tests:
+80 tests (74 on Linux/Windows, which skip the Apple platform suite):
 
 | Suite | Coverage |
 |---|---|

@@ -30,7 +30,7 @@ mmkv-platform-ios = { version = "0.1.0", path = "crates/mmkv-platform-ios" }
 mmkv-platform-linux = { version = "0.1.0", path = "crates/mmkv-platform-linux" }
 mmkv-platform-android = { version = "0.1.0", path = "crates/mmkv-platform-android" }
 mmkv-platform-windows = { version = "0.1.0", path = "crates/mmkv-platform-windows" }
-mmkv-core = { version = "0.1.0", path = "crates/mmkv-core" }
+mmkv-core = { version = "0.1.1", path = "crates/mmkv-core" }
 
 libc = "0.2"
 memmap2 = "0.9"

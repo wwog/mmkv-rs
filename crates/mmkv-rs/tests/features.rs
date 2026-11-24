@@ -156,6 +156,156 @@ fn crypt_full_writeback_and_growth() {
 }
 
 #[test]
+fn borrowed_reads_match_owned_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+    for (id, encrypted) in [("borrow_plain", false), ("borrow_crypt", true)] {
+        let store = if encrypted {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, Some((&key, false)))
+        } else {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, None)
+        };
+
+        let small = "borrowed-small";
+        let large = "B".repeat(700);
+        store.put_str("small", small).unwrap();
+        store.put_str("large", &large).unwrap();
+        store.put_bytes("bin", &[0, 1, 2, 255]).unwrap();
+
+        let mut seen = None;
+        store.with_str("large", |value| seen = value.map(str::to_owned));
+        assert_eq!(seen.as_deref(), Some(large.as_str()));
+
+        let mut seen = None;
+        store.with_str("small", |value| seen = value.map(str::to_owned));
+        assert_eq!(seen.as_deref(), Some(small));
+
+        store.with_bytes("bin", |value| {
+            assert_eq!(value, Some(&[0u8, 1, 2, 255][..]));
+        });
+        store.with_bytes("missing", |value| assert!(value.is_none()));
+        store.with_str("missing", |value| assert!(value.is_none()));
+
+        assert_eq!(store.get_str("large"), Some(large.clone()));
+        assert_eq!(store.get_bytes("bin"), Some(vec![0, 1, 2, 255]));
+    }
+}
+
+#[test]
+fn crypt_compaction_mixes_small_and_large_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+    let store = open(
+        dir.path(),
+        "crypt_compact_mixed",
+        Mode::SINGLE_PROCESS,
+        Some((&key, false)),
+    );
+
+    let large = "L".repeat(700);
+    let grown = "M".repeat(900);
+    for index in 0..120 {
+        store.put_str(&format!("large{index:03}"), &large).unwrap();
+        store.put_str(&format!("small{index:03}"), "tiny").unwrap();
+    }
+    // Overwrites and deletes leave dead records behind, so the next write-back
+    // has to compact non-adjacent runs and rewrite both holder kinds.
+    for index in 0..40 {
+        store.put_str(&format!("large{index:03}"), &grown).unwrap();
+        store.remove(&format!("small{index:03}")).unwrap();
+    }
+    store.trim();
+    assert_eq!(store.count(), 200);
+
+    for index in 0..40 {
+        assert_eq!(
+            store.get_str(&format!("large{index:03}")).as_deref(),
+            Some(grown.as_str())
+        );
+        assert_eq!(store.get_str(&format!("small{index:03}")), None);
+    }
+    for index in 40..120 {
+        assert_eq!(
+            store.get_str(&format!("large{index:03}")).as_deref(),
+            Some(large.as_str())
+        );
+        assert_eq!(
+            store.get_str(&format!("small{index:03}")).as_deref(),
+            Some("tiny")
+        );
+    }
+    store.sync();
+    drop(store);
+
+    let reopened = open(
+        dir.path(),
+        "crypt_compact_mixed",
+        Mode::SINGLE_PROCESS,
+        Some((&key, false)),
+    );
+    assert_eq!(reopened.count(), 200);
+    assert_eq!(
+        reopened.get_str("large039").as_deref(),
+        Some(grown.as_str())
+    );
+    assert_eq!(
+        reopened.get_str("large040").as_deref(),
+        Some(large.as_str())
+    );
+    assert_eq!(reopened.get_str("small040").as_deref(), Some("tiny"));
+    assert_eq!(reopened.get_str("small000"), None);
+}
+
+#[test]
+fn plain_compaction_reuses_offsets_with_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), "plain_compaction", Mode::SINGLE_PROCESS, None);
+
+    for round in 0..4 {
+        for index in 0..120 {
+            let value = format!("r{round}-{}", "x".repeat((index * 13) % 700));
+            store.put_str(&format!("key{index:03}"), &value).unwrap();
+        }
+        store.trim();
+        for index in 0..120 {
+            let expected = format!("r{round}-{}", "x".repeat((index * 13) % 700));
+            assert_eq!(
+                store.get_str(&format!("key{index:03}")),
+                Some(expected),
+                "round {round} key {index}"
+            );
+        }
+    }
+
+    for index in (0..120).step_by(3) {
+        assert!(store.remove(&format!("key{index:03}")).unwrap());
+    }
+    store.trim();
+    assert_eq!(store.count(), 80);
+    for index in 0..120 {
+        if index % 3 == 0 {
+            assert_eq!(store.get_str(&format!("key{index:03}")), None);
+        } else {
+            let expected = format!("r3-{}", "x".repeat((index * 13) % 700));
+            assert_eq!(
+                store.get_str(&format!("key{index:03}")),
+                Some(expected),
+                "key {index}"
+            );
+        }
+    }
+    store.sync();
+    drop(store);
+
+    let reopened = open(dir.path(), "plain_compaction", Mode::SINGLE_PROCESS, None);
+    assert_eq!(reopened.count(), 80);
+    assert_eq!(
+        reopened.get_str("key119"),
+        Some(format!("r3-{}", "x".repeat((119 * 13) % 700)))
+    );
+}
+
+#[test]
 fn rekey_transitions() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path(), "rekey", Mode::SINGLE_PROCESS, None);
@@ -334,6 +484,125 @@ fn expiration_with_encryption() {
     );
     assert_eq!(reopened.get_str("short"), None);
     assert_eq!(reopened.get_i32("num", 0), 9);
+}
+
+#[test]
+fn batch_remove_compacts_plain_and_crypt() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+    let value = "v".repeat(64);
+    for (id, encrypted) in [("batch_plain", false), ("batch_crypt", true)] {
+        let store = if encrypted {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, Some((&key, false)))
+        } else {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, None)
+        };
+        for index in 0..60 {
+            store.put_str(&format!("k{index:02}"), &value).unwrap();
+        }
+        let removed: Vec<String> = (0..30).map(|index| format!("k{index:02}")).collect();
+        let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+        store.remove_many(&removed).unwrap();
+        assert_eq!(store.count(), 30, "{id}");
+        assert_eq!(store.get_str("k00"), None);
+        assert_eq!(store.get_str("k30").as_deref(), Some(value.as_str()));
+        store.sync();
+        drop(store);
+
+        let reopened = if encrypted {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, Some((&key, false)))
+        } else {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, None)
+        };
+        assert_eq!(reopened.count(), 30, "{id}");
+        assert_eq!(reopened.get_str("k00"), None);
+        assert_eq!(reopened.get_str("k59").as_deref(), Some(value.as_str()));
+    }
+}
+
+#[test]
+fn contains_and_large_values_respect_expiration() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+    for (id, encrypted) in [("contains_plain", false), ("contains_crypt", true)] {
+        let store = if encrypted {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, Some((&key, false)))
+        } else {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, None)
+        };
+        store.enable_expiration(0).unwrap();
+
+        // A large expiring value uses an offset holder on the encrypted store;
+        // reading it must go through the cheap trailer check only once.
+        let large = "L".repeat(700);
+        store.put_str_expiring("large", &large, 3_600).unwrap();
+        store.put_str_expiring("short", "one-second", 1).unwrap();
+        store.put_str("keep", "alive").unwrap();
+
+        assert!(store.contains("short"));
+        assert_eq!(store.get_str("large").as_deref(), Some(large.as_str()));
+        assert_eq!(store.get_str("keep").as_deref(), Some("alive"));
+
+        thread::sleep(Duration::from_secs(2));
+        // C++ `containsKey` reports false and deletes an expired key.
+        assert!(!store.contains("short"));
+        assert_eq!(store.count(), 2, "{id}");
+        assert!(store.contains("large"));
+
+        store.sync();
+        drop(store);
+
+        let reopened = if encrypted {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, Some((&key, false)))
+        } else {
+            open(dir.path(), id, Mode::SINGLE_PROCESS, None)
+        };
+        assert_eq!(reopened.count(), 2, "{id}");
+        assert!(!reopened.contains("short"));
+        assert_eq!(reopened.get_str("large").as_deref(), Some(large.as_str()));
+    }
+}
+
+#[test]
+fn writeback_drops_expired_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = CryptKey::new(b"0123456789abcdef".to_vec());
+    let store = open(
+        dir.path(),
+        "expire_writeback",
+        Mode::SINGLE_PROCESS,
+        Some((&key, false)),
+    );
+    store.enable_expiration(0).unwrap();
+
+    let value = "V".repeat(400);
+    for index in 0..30 {
+        store
+            .put_str_expiring(&format!("exp{index:02}"), &value, 1)
+            .unwrap();
+    }
+    store.put_str("keep", "alive").unwrap();
+    thread::sleep(Duration::from_secs(2));
+
+    // Growing the file runs the expiration filter before compacting.
+    for index in 0..80 {
+        store.put_str(&format!("fill{index:02}"), &value).unwrap();
+    }
+    store.trim();
+    assert_eq!(store.count(), 81);
+    assert_eq!(store.count_non_expired(), 81);
+    store.sync();
+    drop(store);
+
+    let reopened = open(
+        dir.path(),
+        "expire_writeback",
+        Mode::SINGLE_PROCESS,
+        Some((&key, false)),
+    );
+    assert_eq!(reopened.count(), 81);
+    assert_eq!(reopened.get_str("keep").as_deref(), Some("alive"));
+    assert_eq!(reopened.get_str("exp00"), None);
 }
 
 #[test]

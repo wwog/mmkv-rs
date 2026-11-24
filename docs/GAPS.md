@@ -57,7 +57,7 @@
 | # | 项 | 说明 |
 |---|---|---|
 | 6.1 | `all_keys` / `count` 的 filterExpire 写回副作用 | Rust 的 `all_keys_non_expired`/`count_non_expired` 只做内存过滤；C++ 在可写实例上可能触发“只清理过期”的全量写回。外部计数一致，文件布局不同。 |
-| 6.2 | 全量写回顺序 | 按 key 排序重建；C++ 按旧 offset 顺序 memmove。C++ 可读，非字节级一致。 |
+| 6.2 | 全量写回顺序 | 已与 C++ 对齐：明文/加密的全量写回都按旧 offset 顺序 memmove（加密路径按 section 原地解密再逐条原地加密）；仅 `rekey`/启用或禁用过期仍按 key 排序重新序列化，C++ 同样要重编码。 |
 | 6.3 | 占位 varint | 固定 `0x200000`（4 字节）；C++ legacy 文件最小 offset ≤5 时可能沿用更窄/更宽占位。语义兼容。 |
 | 6.4 | `cryptKey()` 含 NUL | C++ 用 `strnlen` 截到首个 NUL；Rust 保留完整 key 字节。 |
 | 6.5 | 非 UTF-8 key/value | 内部 key 为 `Box<[u8]>`，但公开 API 接受 `&str`；`all_keys` 对非法 UTF-8 使用 lossy 转换。C++ `std::string` 可保存任意字节。 |
@@ -69,12 +69,12 @@
 
 | # | 项 | 说明 |
 |---|---|---|
-| 7.1 | 加密解码 | 已改为 16 字节窗口流式读取；每字节一次分支，未做块级批量拷贝优化。 |
-| 7.2 | 加密全量写回 | 已改为逐条写入/加密；每条 entry 分配一次临时 `Vec`，峰值 ≈ 最大单条 value，而非整库。 |
-| 7.3 | 零拷贝读取 | `with_bytes`/`with_str` 仍先把值复制到 `Vec` 再回调；未暴露 mmap 切片生命周期 API。 |
+| 7.1 | 加密解码 | 已改为 16 字节窗口流式读取；每字节一次分支，未做块级批量拷贝优化。过期检查已改为只解密末尾 4 字节（`KeyValueHolderCrypt::expiry`）。 |
+| 7.2 | 加密全量写回 | 已改为 C++ 同构的就地算法：按 section `memmove` 密文、用旧 status 原地解密、换新 IV 后逐条原地加密，峰值 = 一条记录，无整库明文/密文缓冲。1.5K 条的全量写回从 ~12.5K 次分配降到 ~21 次。 |
+| 7.3 | 零拷贝读取 | 已实现：getter/`with_bytes`/`with_str` 在锁内直接从 mmap 借用；明文和加密 Direct/Memory holder 零拷贝，只有 >256B 的加密值需要一条临时解密缓冲。 |
 | 7.4 | HashMap hasher | std 默认 SipHash；可用 `foldhash`/`FxHashMap` 提速。 |
 | 7.5 | CRC-32 | 逐字节表实现；未使用 ARMv8 CRC 指令或 `crc32fast`。 |
-| 7.6 | 基准/fuzz | 无 benchmark、无 `cargo-fuzz`、无 Miri/sanitizer。 |
+| 7.6 | 基准/fuzz | 新增 `crates/mmkv-rs/examples/bench.rs`（分配计数 + 计时，`cargo run --release -p mmkv-rs --example bench`）；仍无 `cargo-fuzz`、Miri/sanitizer。 |
 
 ## 8. 其他 API 差异（P2）
 

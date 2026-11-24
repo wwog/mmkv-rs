@@ -191,6 +191,25 @@ impl AesCrypt {
         self.num = num as u8;
     }
 
+    /// Decrypt the slice of the CFB stream that starts at `offset`.
+    ///
+    /// Unlike `clone_with_status` + `decrypt_to`, this neither copies the key
+    /// schedule nor advances `self`, so reading an offset holder is allocation
+    /// free. `ciphertext` is the whole stream `offset` refers to (the payload
+    /// starting at file offset 4).
+    pub fn decrypt_at(&self, ciphertext: &[u8], offset: usize, output: &mut [u8]) {
+        let mut status = self.status_at(ciphertext, offset);
+        let mut num = status.num as usize;
+        for (index, &cipher) in ciphertext[offset..offset + output.len()].iter().enumerate() {
+            if num == 0 {
+                self.cipher.encrypt_block(&mut status.ivec);
+            }
+            output[index] = cipher ^ status.ivec[num];
+            status.ivec[num] = cipher;
+            num = (num + 1) & 0x0f;
+        }
+    }
+
     /// Decrypt `input` into `output` without aliasing.
     pub fn decrypt_to(&mut self, input: &[u8], output: &mut [u8]) {
         debug_assert_eq!(input.len(), output.len());
@@ -267,6 +286,35 @@ mod tests {
         decrypt.reset_iv(Some(&iv));
         decrypt.decrypt(&mut data);
         assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn decrypt_at_matches_the_sequential_stream() {
+        let key = b"0123456789abcdef";
+        let iv = [9u8; 16];
+        let plaintext: Vec<u8> = (0..300).map(|index| index as u8).collect();
+
+        let mut encrypt = AesCrypt::new(key, false);
+        encrypt.reset_iv(Some(&iv));
+        let mut ciphertext = plaintext.clone();
+        encrypt.encrypt(&mut ciphertext);
+
+        let mut decrypt = AesCrypt::new(key, false);
+        decrypt.reset_iv(Some(&iv));
+        for offset in [0usize, 1, 5, 15, 16, 17, 100, 299] {
+            for len in [0usize, 1, 5, 16, 33] {
+                if offset + len > ciphertext.len() {
+                    continue;
+                }
+                let mut output = vec![0u8; len];
+                decrypt.decrypt_at(&ciphertext, offset, &mut output);
+                assert_eq!(
+                    &output[..],
+                    &plaintext[offset..offset + len],
+                    "offset {offset} len {len}"
+                );
+            }
+        }
     }
 
     #[test]
